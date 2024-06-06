@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, Sender, Receiver};
 use lazy_static::lazy_static;
+use chrono::Utc;
 
 pub const RAY_AMM_ADDRESS: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 pub const RAY_LOG_PREFIX: &str = "Program log: ray_log: ";
@@ -205,6 +206,8 @@ pub enum SwapDirection {
 
 pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
     let bytes = base64::decode_config(log, base64::STANDARD).unwrap();
+    let now = Utc::now();
+    let timestamp = now.timestamp();
     match LogType::from_u8(bytes[0]) {
         LogType::Init => {
             let log: InitLog = bincode::deserialize(&bytes).unwrap();
@@ -229,7 +232,8 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token0: log.pool_coin,
                 token1: log.pool_pc,
                 delta0: log.deduct_coin as i64,
-                delta1: log.deduct_pc as i64
+                delta1: log.deduct_pc as i64,
+                timestamp
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("deposit log{:?}", log);
@@ -249,7 +253,8 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token0: log.pool_coin,
                 token1: log.pool_pc,
                 delta0: -(log.out_coin as i64),
-                delta1: -(log.out_pc as i64)
+                delta1: -(log.out_pc as i64),
+                timestamp
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("withdraw log {:?}", log);
@@ -276,6 +281,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0,
                 delta1,
+                timestamp
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("swap in log{:?}", log);
@@ -302,6 +308,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0,
                 delta1,
+                timestamp
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("swap out log{:?}", log);
