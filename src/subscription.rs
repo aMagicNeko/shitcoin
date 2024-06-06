@@ -15,6 +15,7 @@ use lazy_static::lazy_static;
 use crate::raydium_amm::{RAY_AMM_ADDRESS, parse_raydium_transaction};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use tokio::time::{timeout};
 
 #[derive(Debug)]
 pub struct Transaction {
@@ -147,8 +148,9 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
         info!("Starting subscription task");
         let url = "wss://atlas-mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
         loop { // might lose some data
-        match connect_async(url).await {
-            Ok((mut ws_stream, _)) => {
+        let timeout_duration = Duration::from_secs(5);
+        match timeout(timeout_duration, connect_async(url)).await {
+            Ok(Ok((mut ws_stream, _))) => {
                 let params = json!([
                     {
                         "vote": false,
@@ -177,7 +179,7 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                 }
                 info!("Subscription request sent successfully");
                 let mut transaction_filter = TransactionFilter::new();
-                while let Some(message) = ws_stream.next().await {
+                while let Ok(Some(message)) = timeout(timeout_duration,  ws_stream.next()).await {
                     //info!("{:?}", message);
                     match message {
                         Ok(Message::Text(text)) => {
@@ -225,6 +227,9 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                     }
                 }
             }
+            Ok(Err(e)) => {
+                eprintln!("Error while connecting: {}", e);
+            },
             Err(e) => {
                 error!("Failed to connect to Solana WebSocket: {}", e);
             }
