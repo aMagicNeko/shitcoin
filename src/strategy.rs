@@ -72,7 +72,8 @@ impl Strategy for DataSavingStrategy {
         else {
             step.token1 as i64 + step.delta1
         };
-        if nsol < 100000000 {
+        // 0.01 sol
+        if nsol < 10000000 {
             // Save to Excel file
             self.save_to_excel();
             true

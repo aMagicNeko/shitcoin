@@ -47,6 +47,9 @@ impl RaydiumAmmPool {
             info!("new pool {:?}", pool);
             while let Some(step) = rx.recv().await {
                 if strategy.on_transaction(&step, token0 == SOL) {
+                    let mut pools = POOL_MANAGER.pools.lock().await;
+                    pools.remove(&address);
+                    info!("pool {} end", address);
                     return
                 }
             }
