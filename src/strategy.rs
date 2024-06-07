@@ -4,6 +4,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 use log::info;
+use std::fs;
 #[derive(Debug, Clone)]
 pub struct Step {
     pub from: Pubkey,
@@ -58,6 +59,9 @@ impl DataSavingStrategy {
 
         workbook.close().unwrap();
         let after_path = format!("coin_data/{}", self.file_path);
+        if Path::new(&after_path).exists() {
+            fs::remove_file(after_path.clone()).unwrap();
+        }
         std::fs::rename(&self.file_path, after_path).unwrap();
     }
 }
