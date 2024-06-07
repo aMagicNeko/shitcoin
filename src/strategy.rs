@@ -57,6 +57,8 @@ impl DataSavingStrategy {
         }
 
         workbook.close().unwrap();
+        let after_path = format!("coin_data/{}", self.file_path);
+        std::fs::rename(&self.file_path, after_path).unwrap();
     }
 }
 
