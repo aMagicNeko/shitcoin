@@ -9,14 +9,21 @@ use log::{info, error};
 use solana_sdk::{
     blake3::Hash, clock::Slot, commitment_config::{CommitmentConfig, CommitmentLevel}, instruction::CompiledInstruction, message::VersionedMessage::{Legacy, V0}, pubkey::{self, Pubkey}, signature::{self, Signature}
 };
-use core::hash;
-use std::collections::{HashMap, VecDeque};
+use tokio::sync::RwLock;
+use std::{collections::{HashMap, VecDeque}};
 use lazy_static::lazy_static;
-use crate::raydium_amm::{RAY_AMM_ADDRESS, parse_raydium_transaction};
+use crate::raydium_amm::{RAY_AMM_ADDRESS, OPENBOOK_MARKET, parse_raydium_transaction, OpenbookInfo, OPENBOOK_MARKET_CACHE, parse_serum_instruction};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::{timeout};
-
+use solana_client::{nonblocking::pubsub_client:: PubsubClient, rpc_response::{RpcBlockUpdate, SlotUpdate}};
+use tokio::sync::broadcast;
+use std::sync::Arc;
+use solana_client::{
+    rpc_config::{RpcBlockSubscribeConfig, RpcBlockSubscribeFilter},
+    rpc_response,
+};
+use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 #[derive(Debug)]
 pub struct Transaction {
     pub account_keys: Vec<Pubkey>,
@@ -55,15 +62,15 @@ impl Transaction {
             }
         }
         let mut ray_amm_id: i32 = 256;
+        let mut openbook_id: i32 = 257;
         let mut i = 0;
         for account in &account_keys {
-            if *account == RAY_AMM_ADDRESS {
-                ray_amm_id = i
-            }
+            match account {
+                &RAY_AMM_ADDRESS => ray_amm_id = i,
+                &OPENBOOK_MARKET => openbook_id = i,
+                _ => (),
+            };
             i += 1
-        }
-        if ray_amm_id == 256 {
-            return
         }
         let mut ray_logs: Vec<String> = Vec::new();
         if let OptionSerializer::Some(logs) = &self.meta.log_messages {
@@ -75,12 +82,18 @@ impl Transaction {
         }
         let mut ray_instructions: Vec<Instruction> = Vec::new();
         for (i, instruction) in self.instructions.iter().enumerate() {
-            if instruction.program_id_index == ray_amm_id as u8 {
-                let mut accounts: Vec<Pubkey> = Vec::with_capacity(instruction.accounts.len());
-                for index in &instruction.accounts {
-                    accounts.push(account_keys[*index as usize]);
+            match instruction.program_id_index {
+                id if id == ray_amm_id as u8  => {
+                    let mut accounts: Vec<Pubkey> = Vec::with_capacity(instruction.accounts.len());
+                    for index in &instruction.accounts {
+                        accounts.push(account_keys[*index as usize]);
+                    }
+                    ray_instructions.push(Instruction{out_index: i, inner_index: -1, accounts, data: instruction.data.clone()});
                 }
-                ray_instructions.push(Instruction{out_index: i, inner_index: -1, accounts: accounts, data: instruction.data.clone()});
+                id if id == openbook_id as u8 => {
+                    parse_serum_instruction(&instruction.data, &instruction.accounts, &account_keys).await;
+                }
+                _ => ()
             }
         }
         if let OptionSerializer::Some(inner_instructions) = &self.meta.inner_instructions {
@@ -146,7 +159,7 @@ impl TransactionFilter {
 pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
     task::spawn(async move {
         info!("Starting subscription task");
-        let url = "wss://atlas-mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
+        let url = "wss://atlas-devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
         loop { // might lose some data
         let timeout_duration = Duration::from_secs(5);
         match timeout(timeout_duration, connect_async(url)).await {
@@ -155,7 +168,8 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                     {
                         "vote": false,
                         "failed": false,
-                        "accountInclude": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"]
+                        "accountInclude": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"]
+                        //"accountInclude": ["HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8", "82iPEvGiTceyxYpeLK3DhSwga3R5m4Yfyoydd13CukQ9"]
                     },
                     {
                         "commitment": "processed",
@@ -180,7 +194,7 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                 info!("Subscription request sent successfully");
                 let mut transaction_filter = TransactionFilter::new();
                 while let Ok(Some(message)) = timeout(timeout_duration,  ws_stream.next()).await {
-                    //info!("{:?}", message);
+                    info!("{:?}", message);
                     match message {
                         Ok(Message::Text(text)) => {
                             if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -236,4 +250,80 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
         }
     }
     });
+}
+
+lazy_static! {
+    pub static ref SLOT_BROADCAST_CHANNEL: (broadcast::Sender<u64>, broadcast::Receiver<u64>) = broadcast::channel(16);
+}
+lazy_static! {
+    pub static ref CURRENT_SLOT: Arc<RwLock<u64>> = Arc::new(RwLock::new(0));
+}
+// slot update subscription loop that attempts to maintain a connection to an RPC server
+pub fn start_slot_subscription() {
+    let pubsub_addr = "wss://devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
+    task::spawn(async move {
+    info!("Starting subscription task");
+    loop {
+        let tx = SLOT_BROADCAST_CHANNEL.0.clone();
+        match PubsubClient::new(&pubsub_addr).await {
+            Ok(pubsub_client) => match pubsub_client.slot_updates_subscribe().await {
+                Ok((mut slot_update_subscription, _unsubscribe_fn)) => {
+                    let timeout_duration = Duration::from_secs(1);
+                    while let Ok(Some(slot_update)) = timeout(timeout_duration, slot_update_subscription.next()).await {
+                        if let SlotUpdate::FirstShredReceived { slot, timestamp: _ } = slot_update {
+                            info!("slot_subscribe_slot{}", slot);
+                            let mut current_slot = CURRENT_SLOT.write().await;
+                            *current_slot = slot;
+                            tx.send(slot).unwrap();
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("slot_subscribe_error {}", e.to_string());
+                }
+            },
+            Err(e) => {
+                error!("slot_subscribe_pubsub_connect_error {}",e.to_string());
+            }
+        }
+    }
+});
+}
+
+pub fn block_subscribe_loop() {
+    task::spawn(async move {
+    loop {
+        match PubsubClient::new("wss://devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2").await {
+            Ok(pubsub_client) => match pubsub_client
+                .block_subscribe(
+                    RpcBlockSubscribeFilter::All,
+                    Some(RpcBlockSubscribeConfig {
+                        commitment: Some(CommitmentConfig {
+                            commitment: CommitmentLevel::Processed,
+                        }),
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        transaction_details: Some(TransactionDetails::None),
+                        show_rewards: Some(false),
+                        max_supported_transaction_version: None,
+                    }),
+                )
+                .await
+            {
+                Ok((mut block_update_subscription, _unsubscribe_fn)) => {
+                    while let Some(block_update) = block_update_subscription.next().await {
+                        if let Some(block) = block_update.value.block {
+                            info!("block hash {}", block.blockhash);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("block subscribe error {e}");
+                }
+            },
+            Err(e) => {
+                error!("block subscribe error {e}");
+            }
+        }
+    }
+});
 }
