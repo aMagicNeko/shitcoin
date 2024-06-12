@@ -1,4 +1,3 @@
-# data_processing.py
 import os
 import pandas as pd
 import numpy as np
@@ -27,7 +26,6 @@ def process_transaction_data(df):
 
     return second_start_data, data, data_per_second
 
-# 收集特征
 def collect_features(data, current_time, cumulative_data, data_per_second):
     features = {}
     
@@ -64,19 +62,23 @@ def collect_features(data, current_time, cumulative_data, data_per_second):
     # 持仓分布特征
     holding_data = cumulative_data[(cumulative_data['time'] <= current_time)]
     address_counts = holding_data.groupby('From')['cumulative_delta0'].last()
-    total_token0 = address_counts.sum()
-    address_proportions = [count / total_token0 for count in address_counts]
+    total_token0 = address_counts[address_counts > 0].sum()
+    address_proportions = [count / total_token0 for count in address_counts if count > 0]
+    
+    # 排除持仓为负数的地址
+    negative_holdings = address_counts[address_counts < 0].sum()
+    features['negative_holdings'] = negative_holdings
 
     # 地址数量
-    features['num_addresses'] = len(address_counts)
+    features['num_addresses'] = len(address_counts[address_counts > 0])
     # 最大地址持仓比例
-    features['max_address_holding'] = max(address_proportions)
+    features['max_address_holding'] = max(address_proportions) if address_proportions else 0
     # 前5大地址持仓比例
-    features['top_5_address_holding'] = sum(sorted(address_proportions, reverse=True)[:5])
+    features['top_5_address_holding'] = sum(sorted(address_proportions, reverse=True)[:5]) if address_proportions else 0
     # 前10大地址持仓比例
-    features['top_10_address_holding'] = sum(sorted(address_proportions, reverse=True)[:10])
+    features['top_10_address_holding'] = sum(sorted(address_proportions, reverse=True)[:10]) if address_proportions else 0
     # 持仓分布的熵
-    features['holding_entropy'] = entropy(address_proportions)
+    features['holding_entropy'] = entropy(address_proportions) if address_proportions else 0
 
     return features
 
@@ -122,7 +124,6 @@ def collect_targets(data, current_time):
         targets['max_decrease_all'] = current_token0  # 没有数据变化，保持当前值
 
     return targets
-
 def read_and_process(file_path):
     try:
         df = pd.read_excel(file_path)
