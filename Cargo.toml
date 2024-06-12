@@ -33,7 +33,8 @@ bincode = { version = "1.3.3" }
 base64 = "0.13"
 #arrayref = "0.3.6"
 #arrform = { git = "https://github.com/raydium-io/arrform" }
-xlsxwriter = "0.6.0"
+#xlsxwriter = "0.6.0"
+polars = { version = "0.40.0", features = ["parquet"] }
 serum_dex = {git = "https://github.com/project-serum/serum-dex.git"}
 hex = "0.4"
 once_cell = "1.9.0"

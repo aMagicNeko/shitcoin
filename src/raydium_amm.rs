@@ -10,7 +10,7 @@ use log::{info, error};
 use tokio::task;
 use crate::strategy::{self, DataSavingStrategy, Step};
 use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT}, strategy::Strategy};
-use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, KEYPAIR, execute_tx_with_comfirm, RPC_CLIENT};
+use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT};
 use serde::{Deserialize, Serialize};
 extern crate base64;
 use std::collections::HashMap;
@@ -98,15 +98,15 @@ impl RaydiumAmmPool {
                 market_vault_signer,
             };
             let sol_as_coin = coin_mint == SOL;
-            if let Err(e) = pool.execute_swap(80000000, sol_as_coin).await {
+            /*if let Err(e) = pool.execute_swap(80000000, sol_as_coin).await {
                 let mut pools = POOL_MANAGER.pools.lock().await;
                 pools.remove(&amm_pool);
                 error!("pool {} first swap failed:{}", amm_pool, e);
                 return
-            }
+            }*/
             info!("new pool {:?}", pool);
             let mut pending_swap = true;
-            let mut strategy = DataSavingStrategy::new(&amm_pool);
+            let mut strategy = DataSavingStrategy::new(&amm_pool, sol_as_coin);
             let mut slot_rx = SLOT_BROADCAST_CHANNEL.0.subscribe();
             let mut slot: u64 = *CURRENT_SLOT.read().await;
             let mut delta_sol: i64 = 0;
@@ -116,6 +116,7 @@ impl RaydiumAmmPool {
                     Some(step) = rx.recv() => {
                         pool.ntoken0 = step.token0;
                         pool.ntoken1 = step.token1;
+                        /*
                         if step.from == KEYPAIR.pubkey() {
                             pending_swap = false;
                             if sol_as_coin {
@@ -127,7 +128,7 @@ impl RaydiumAmmPool {
                                 delta_token -= step.delta0;
                             }
                         }
-                        else if strategy.on_transaction(&step, coin_mint == SOL) {
+                        else */if strategy.on_transaction(&step) {
                             break;
                         }
                     },
@@ -145,7 +146,7 @@ impl RaydiumAmmPool {
         });
         tx
     }
-
+    /*
     pub async fn execute_swap(&self, amount_in: u64, zero_for_one: bool) -> Result<(), Error> {
         let user_source_owner = KEYPAIR.pubkey();
         let (mint0, mint1) = if zero_for_one {
@@ -209,6 +210,7 @@ impl RaydiumAmmPool {
         // get tx detais here or wait for websocket?
         Ok(())
     }
+    */
 
 }
 
@@ -304,8 +306,9 @@ impl RaydiumAmmPoolManager {
 
 pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
     let bytes = base64::decode_config(log, base64::STANDARD).unwrap();
-    let now = Utc::now();
-    let timestamp = now.timestamp();
+    //let now = Utc::now();
+    //let timestamp = now.timestamp();
+    let slot: u64 = *CURRENT_SLOT.read().await;
     match LogType::from_u8(bytes[0]) {
         LogType::Init => {
             let log: InitLog = bincode::deserialize(&bytes).unwrap();
@@ -324,7 +327,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0: log.deduct_coin as i64,
                 delta1: log.deduct_pc as i64,
-                timestamp
+                slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("deposit log{:?}", log);
@@ -345,7 +348,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0: -(log.out_coin as i64),
                 delta1: -(log.out_pc as i64),
-                timestamp
+                slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("withdraw log {:?}", log);
@@ -372,7 +375,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0,
                 delta1,
-                timestamp
+                slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("swap in log{:?}", log);
@@ -399,7 +402,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 token1: log.pool_pc,
                 delta0,
                 delta1,
-                timestamp
+                slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
             info!("swap out log{:?}", log);

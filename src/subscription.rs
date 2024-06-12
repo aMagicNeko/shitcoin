@@ -159,7 +159,7 @@ impl TransactionFilter {
 pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
     task::spawn(async move {
         info!("Starting subscription task");
-        let url = "wss://atlas-devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
+        let url = "wss://atlas-mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
         loop { // might lose some data
         let timeout_duration = Duration::from_secs(5);
         match timeout(timeout_duration, connect_async(url)).await {
@@ -260,7 +260,7 @@ lazy_static! {
 }
 // slot update subscription loop that attempts to maintain a connection to an RPC server
 pub fn start_slot_subscription() {
-    let pubsub_addr = "wss://devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
+    let pubsub_addr = "wss://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
     task::spawn(async move {
     info!("Starting subscription task");
     loop {
@@ -293,7 +293,7 @@ pub fn start_slot_subscription() {
 pub fn block_subscribe_loop() {
     task::spawn(async move {
     loop {
-        match PubsubClient::new("wss://devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2").await {
+        match PubsubClient::new("wss://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2").await {
             Ok(pubsub_client) => match pubsub_client
                 .block_subscribe(
                     RpcBlockSubscribeFilter::All,

@@ -30,16 +30,16 @@ use solana_client::rpc_request::TokenAccountsFilter;
 use solana_account_decoder::{UiAccountEncoding, parse_token, UiAccountData};
 use solana_transaction_status::parse_accounts::ParsedAccount;
 
-pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
-    read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
-});
+//pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
+//    read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
+//});
 
 lazy_static! {
     static ref MIN_BALANCE_FOR_RENT_EXEMPTION: Arc<RwLock<u64>> = Arc::new(RwLock::new(0));
 }
 
 pub static RPC_CLIENT: Lazy<Arc<RpcClient>> = Lazy::new(|| {
-    Arc::new(RpcClient::new("https://devnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2"))
+    Arc::new(RpcClient::new("https://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2"))
 });
 
 lazy_static! {
@@ -102,7 +102,7 @@ pub async fn gen_associated_token_account(token_mint: &Pubkey, payer: &Pubkey) -
     TOKEN_VAULT_MAP.write().await.insert(token_mint.clone(), user_token_destination);
     Ok((instructions, user_token_destination))
 }
-
+/*
 pub async fn send_transaction(instructions: &[Instruction], ) -> Result<(), Error> {
     let pubkey = KEYPAIR.pubkey();
     if let Some(block_hash) =  RECENT_BLOCKHASH.read().await.clone() {
@@ -228,3 +228,4 @@ pub async fn execute_tx_with_comfirm(instructions: &[Instruction]) -> Result<Sig
         Err(anyhow!("create wsol account failed: no block hash find"))
     }
 }
+    */
