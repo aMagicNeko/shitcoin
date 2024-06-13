@@ -114,9 +114,11 @@ impl Transaction {
                 }
             }
         }
-        if ray_logs.len() != 0 {
+        if ray_logs.len() != 0 && ray_amm_id != 256 {
             ray_instructions.sort_unstable();
-            parse_raydium_transaction(&ray_instructions, &ray_logs).await;
+            if let Err(e) = parse_raydium_transaction(&ray_instructions, &ray_logs).await {
+                error!("error tx:{:?}", self);
+            }
         }
     }
 }
@@ -194,7 +196,7 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                 info!("Subscription request sent successfully");
                 let mut transaction_filter = TransactionFilter::new();
                 while let Ok(Some(message)) = timeout(timeout_duration,  ws_stream.next()).await {
-                    info!("{:?}", message);
+                    //info!("{:?}", message);
                     match message {
                         Ok(Message::Text(text)) => {
                             if let Ok(response) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -271,7 +273,7 @@ pub fn start_slot_subscription() {
                     let timeout_duration = Duration::from_secs(1);
                     while let Ok(Some(slot_update)) = timeout(timeout_duration, slot_update_subscription.next()).await {
                         if let SlotUpdate::FirstShredReceived { slot, timestamp: _ } = slot_update {
-                            info!("slot_subscribe_slot{}", slot);
+                            //info!("slot_subscribe_slot{}", slot);
                             let mut current_slot = CURRENT_SLOT.write().await;
                             *current_slot = slot;
                             tx.send(slot).unwrap();

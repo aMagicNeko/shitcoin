@@ -8,9 +8,9 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
 use log::{info, error};
 use tokio::task;
-use crate::strategy::{self, DataSavingStrategy, Step};
-use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT}, strategy::Strategy};
-use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT};
+use crate::strategy::{self, DataSavingStrategy, Step, FallSellStrategy};
+use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT}, strategy::{Strategy, OnTransactionRet}};
+use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT, KEYPAIR, execute_tx_with_comfirm};
 use serde::{Deserialize, Serialize};
 extern crate base64;
 use std::collections::HashMap;
@@ -22,12 +22,17 @@ use chrono::Utc;
 use raydium_amm::{log::{DepositLog, WithdrawLog, InitLog, SwapBaseInLog, SwapBaseOutLog, LogType}, instruction::{AmmInstruction, swap_base_in}, math::SwapDirection::Coin2PC};
 use serum_dex::{instruction::MarketInstruction, state::gen_vault_signer_key};
 use anyhow::{anyhow};
+use once_cell::sync::Lazy;
+use tokio::sync::RwLock;
 //pub const RAY_AMM_ADDRESS: Pubkey = pubkey!("HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8");
 pub const RAY_AMM_ADDRESS: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 pub const RAY_LOG_PREFIX: &str = "Program log: ray_log: ";
 pub const SOL: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 pub const OPENBOOK_MARKET: Pubkey = pubkey!("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX");
 //pub const OPENBOOK_MARKET: Pubkey = pubkey!("82iPEvGiTceyxYpeLK3DhSwga3R5m4Yfyoydd13CukQ9");
+pub static MY_SOL: Lazy<Arc<RwLock<u64>>> = Lazy::new(|| {
+    Arc::new(RwLock::new(1000000000))
+});
 #[derive(Debug)]
 pub struct RaydiumAmmPool {
     pub coin_mint: Pubkey,
@@ -40,6 +45,7 @@ pub struct RaydiumAmmPool {
     pub amm_pool: Pubkey,
     pub amm_authority: Pubkey,
     pub amm_open_orders: Pubkey,
+    pub amm_target_orders: Pubkey,
     pub amm_coin_vault: Pubkey,
     pub amm_pc_vault: Pubkey,
     pub market_program: Pubkey,
@@ -50,6 +56,10 @@ pub struct RaydiumAmmPool {
     pub market_coin_vault: Pubkey,
     pub market_pc_vault: Pubkey,
     pub market_vault_signer: Pubkey,
+}
+
+lazy_static! {
+    static ref ONLY_ONE_POOL: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
 }
 
 impl RaydiumAmmPool {
@@ -63,6 +73,7 @@ impl RaydiumAmmPool {
         amm_pool: Pubkey,
         amm_authority: Pubkey,
         amm_open_orders: Pubkey,
+        amm_target_orders: Pubkey,
         amm_coin_vault: Pubkey,
         amm_pc_vault: Pubkey,
         market_program: Pubkey,
@@ -86,6 +97,7 @@ impl RaydiumAmmPool {
                 amm_pool,
                 amm_authority,
                 amm_open_orders,
+                amm_target_orders,
                 amm_coin_vault,
                 amm_pc_vault,
                 market_program,
@@ -97,44 +109,93 @@ impl RaydiumAmmPool {
                 market_pc_vault,
                 market_vault_signer,
             };
+            {
+                let mut p = ONLY_ONE_POOL.lock().await;
+                if *p != 0 {
+                    let mut pools = POOL_MANAGER.pools.lock().await;
+                        pools.remove(&amm_pool);
+                        return
+                }
+                *p = 1;
+            }
             let sol_as_coin = coin_mint == SOL;
-            /*if let Err(e) = pool.execute_swap(80000000, sol_as_coin).await {
-                let mut pools = POOL_MANAGER.pools.lock().await;
-                pools.remove(&amm_pool);
-                error!("pool {} first swap failed:{}", amm_pool, e);
-                return
-            }*/
             info!("new pool {:?}", pool);
-            let mut pending_swap = true;
-            let mut strategy = DataSavingStrategy::new(&amm_pool, sol_as_coin);
+            let init_sol = if sol_as_coin {
+                ntoken0
+            }
+            else {
+                ntoken1
+            };
+            //let mut strategy = DataSavingStrategy::new(&amm_pool, sol_as_coin, );
+            let mut strategy = FallSellStrategy::new(init_sol, sol_as_coin);
             let mut slot_rx = SLOT_BROADCAST_CHANNEL.0.subscribe();
             let mut slot: u64 = *CURRENT_SLOT.read().await;
-            let mut delta_sol: i64 = 0;
-            let mut delta_token: i64 = 0;
+            let mut failed_cnt = 0;
+            if let Some(swap_decision) = strategy.init_process() {
+                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_decision.zero_for_one).await {
+                    info!("init swap error {e}");
+                    failed_cnt += 1;
+                    if failed_cnt > 4 {
+                        let mut pools = POOL_MANAGER.pools.lock().await;
+                        pools.remove(&amm_pool);
+                        info!("pool {} end", amm_pool);
+                        return
+                    }
+                }
+            }
+            info!("strategy init success!");
             loop {
                 tokio::select! {
                     Some(step) = rx.recv() => {
                         pool.ntoken0 = step.token0;
                         pool.ntoken1 = step.token1;
-                        /*
+                        info!("{:?}" ,step);
                         if step.from == KEYPAIR.pubkey() {
-                            pending_swap = false;
-                            if sol_as_coin {
-                                delta_sol -= step.delta0;
-                                delta_token -= step.delta1;
+                            if step.delta0 > 0 && sol_as_coin {
+                                strategy.on_buy(&step);
+                                let mut my_sol = MY_SOL.write().await;
+                                *my_sol -= step.delta0 as u64;
+                            }
+                            else if step.delta1 > 0 && !sol_as_coin {
+                                strategy.on_buy(&step);
+                                let mut my_sol = MY_SOL.write().await;
+                                *my_sol -= step.delta1 as u64;
+                            }
+                            else if step.delta0 > 0 && !sol_as_coin {
+                                let mut my_sol = MY_SOL.write().await;
+                                *my_sol += (-step.delta1) as u64;
+                                if strategy.on_sell(&step) {
+                                    break;
+                                }
                             }
                             else {
-                                delta_sol -= step.delta1;
-                                delta_token -= step.delta0;
+                                let mut my_sol = MY_SOL.write().await;
+                                *my_sol += (-step.delta0) as u64;
+                                if strategy.on_sell(&step) {
+                                    break;
+                                }
                             }
                         }
-                        else */if strategy.on_transaction(&step) {
-                            break;
+                        else {
+                            match strategy.on_transaction(&step) {
+                                OnTransactionRet::SwapDecision(swap_decision) => {
+                                    let mut i = 0;
+                                    while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_decision.zero_for_one).await {
+                                        error!("execute_swap {}th failed: {}", i, e);
+                                        i += 1;
+                                    }
+                                },
+                                OnTransactionRet::End(is_end) => {
+                                    if is_end {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     },
                     Ok(current_slot) = slot_rx.recv() => {
                         slot = current_slot;
-                        info!("{}", slot);
+                        //info!("{}", slot);
                     }
                     else => error!("channel closed"),
                 }
@@ -146,8 +207,14 @@ impl RaydiumAmmPool {
         });
         tx
     }
-    /*
+    
     pub async fn execute_swap(&self, amount_in: u64, zero_for_one: bool) -> Result<(), Error> {
+        if self.coin_mint == SOL && zero_for_one && amount_in > *MY_SOL.read().await {
+            return Err(anyhow!("no enough wsol!"));
+        }
+        if self.pc_mint == SOL && !zero_for_one && amount_in > *MY_SOL.read().await {
+            return Err(anyhow!("no enough wsol!"));
+        }
         let user_source_owner = KEYPAIR.pubkey();
         let (mint0, mint1) = if zero_for_one {
             (self.coin_mint ,self.pc_mint)
@@ -185,6 +252,7 @@ impl RaydiumAmmPool {
             &self.amm_pool,
             &self.amm_authority,
             &self.amm_open_orders,
+            &self.amm_open_orders,
             &self.amm_coin_vault,
             &self.amm_pc_vault,
             &self.market_program,
@@ -206,11 +274,12 @@ impl RaydiumAmmPool {
         };
     
         instructions.push(instruction);
+        //info!("prepare to swap:{:?}", instructions);
         let sig = execute_tx_with_comfirm(&instructions).await?;
+        info!("complete swap:{}", sig);
         // get tx detais here or wait for websocket?
         Ok(())
     }
-    */
 
 }
 
@@ -221,7 +290,6 @@ pub struct RaydiumAmmPoolManager {
 lazy_static! {
     static ref POOL_MANAGER: Arc<RaydiumAmmPoolManager> = Arc::new(RaydiumAmmPoolManager::new());
 }
-
 pub struct OpenbookInfo {
     pub market: Pubkey,
     pub req_queue: Pubkey,
@@ -255,6 +323,7 @@ impl RaydiumAmmPoolManager {
             let pc_mint = instruction.accounts[9]; // mint
             let amm_coin_vault = instruction.accounts[10];
             let amm_pc_vault = instruction.accounts[11];
+            let target_orders = instruction.accounts[12];
             let market_program = instruction.accounts[15];
             let market = instruction.accounts[16];
             // maybe useful
@@ -276,6 +345,7 @@ impl RaydiumAmmPoolManager {
                     amm_pool,
                     amm_authority,
                     amm_open_orders,
+                    target_orders,
                     amm_coin_vault,
                     amm_pc_vault,
                     market_program,
@@ -315,7 +385,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
             let ntoken0 = log.coin_amount;
             let ntoken1 = log.pc_amount;
             POOL_MANAGER.add_pool(&instruction, ntoken0, ntoken1).await;
-            info!("init log{:?}", log);
+            //info!("init log{:?}", log);
         }
         LogType::Deposit => {
             let log: DepositLog = bincode::deserialize(&bytes).unwrap();
@@ -330,7 +400,7 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
-            info!("deposit log{:?}", log);
+            //info!("deposit log{:?}", log);
         }
         LogType::Withdraw => {
             let log: WithdrawLog = bincode::deserialize(&bytes).unwrap();
@@ -351,17 +421,17 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
-            info!("withdraw log {:?}", log);
+            //info!("withdraw log {:?}", log);
         }
         LogType::SwapBaseIn => {
             let log: SwapBaseInLog = bincode::deserialize(&bytes).unwrap();
             let pool_address = instruction.accounts[1];
             const ACCOUNT_LEN: usize = 17;
             let from = if instruction.accounts.len() == ACCOUNT_LEN + 1 {
-                instruction.accounts[15]
+                instruction.accounts[17]
             }
             else {
-                instruction.accounts[14]
+                instruction.accounts[16]
             };
             let (delta0, delta1) = if log.direction == Coin2PC as u64{
                 (log.amount_in as i64, -(log.out_amount as i64))
@@ -378,17 +448,17 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
-            info!("swap in log{:?}", log);
+            //info!("swap in log{:?}", log);
         }
         LogType::SwapBaseOut => {
             let log: SwapBaseOutLog = bincode::deserialize(&bytes).unwrap();
             let pool_address = instruction.accounts[1];
             const ACCOUNT_LEN: usize = 17;
             let from = if instruction.accounts.len() == ACCOUNT_LEN + 1 {
-                instruction.accounts[15]
+                instruction.accounts[17]
             }
             else {
-                instruction.accounts[14]
+                instruction.accounts[16]
             };
             let (delta0, delta1) = if log.direction == Coin2PC as u64{
                 (log.deduct_in as i64, -(log.amount_out as i64))
@@ -405,81 +475,100 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
-            info!("swap out log{:?}", log);
+            //info!("swap out log{:?}", log);
         }
     }
 }
 
-pub async fn parse_raydium_transaction(instructions: &Vec<Instruction>, logs: &Vec<String>) {
-    info!("raydium tx:{:?}:{:?}", instructions, logs);
+pub async fn parse_raydium_transaction(instructions: &Vec<Instruction>, logs: &Vec<String>) -> Result<(), Error> {
+    //info!("raydium tx:{:?}:{:?}", instructions, logs);
+    if instructions.len() < logs.len() {
+        error!("raydium tx:{:?}:{:?} size not comp", instructions, logs);
+        return Err(anyhow!("size not comp"));
+    }
     let mut j: usize = 0; // instruction iter
     for (i, log) in logs.iter().enumerate() {
-        while let Ok(instruction) = AmmInstruction::unpack(&instructions[j].data) {
-            match instruction {
-                AmmInstruction::PreInitialize(_init_arg) => {
-                    j += 1;
-                    continue;
+        /*
+        while j < instructions.len() {
+            match AmmInstruction::unpack(&instructions[j].data) {
+                Ok(instruction) => 
+                match instruction {
+                    AmmInstruction::PreInitialize(_init_arg) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::Initialize(_init1) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::Initialize2(init2) => {
+                        break;
+                    }
+                    AmmInstruction::MonitorStep(monitor) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::Deposit(deposit) => {
+                        break;
+                    }
+                    AmmInstruction::Withdraw(withdraw) => {
+                        break;
+                    }
+                    AmmInstruction::MigrateToOpenBook => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::SetParams(setparams) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::WithdrawPnl => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::WithdrawSrm(withdrawsrm) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::SwapBaseIn(swap) => {
+                        break;
+                    }
+                    AmmInstruction::SwapBaseOut(swap) => {
+                        break;
+                    }
+                    AmmInstruction::SimulateInfo(simulate) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::AdminCancelOrders(cancel) => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::CreateConfigAccount => {
+                        j += 1;
+                        continue;
+                    }
+                    AmmInstruction::UpdateConfigAccount(config_args) => {
+                        j += 1;
+                        continue;
+                    }
                 }
-                AmmInstruction::Initialize(_init1) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::Initialize2(init2) => {
-                    break;
-                }
-                AmmInstruction::MonitorStep(monitor) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::Deposit(deposit) => {
-                    break;
-                }
-                AmmInstruction::Withdraw(withdraw) => {
-                    break;
-                }
-                AmmInstruction::MigrateToOpenBook => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::SetParams(setparams) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::WithdrawPnl => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::WithdrawSrm(withdrawsrm) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::SwapBaseIn(swap) => {
-                    break;
-                }
-                AmmInstruction::SwapBaseOut(swap) => {
-                    break;
-                }
-                AmmInstruction::SimulateInfo(simulate) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::AdminCancelOrders(cancel) => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::CreateConfigAccount => {
-                    j += 1;
-                    continue;
-                }
-                AmmInstruction::UpdateConfigAccount(config_args) => {
+                Err(e) => {
+                    error!("unpack error:{} {e}", j);
                     j += 1;
                     continue;
                 }
             }
         }
+        */
+        if j >= instructions.len() {
+            error!("raydium tx:{:?}:{:?} size not comp j = {}", instructions, logs, j);
+            return Err(anyhow!("size not comp"));
+        }
         decode_ray_log(&log[RAY_LOG_PREFIX.len()..], &instructions[j]).await;
         j += 1;
     }
+    Ok(())
 }
 
 pub async fn parse_serum_instruction(data: &[u8], accounts: &[u8], account_keys: &[Pubkey]) {

@@ -38,6 +38,8 @@ polars = { version = "0.40.0", features = ["parquet"] }
 serum_dex = {git = "https://github.com/project-serum/serum-dex.git"}
 hex = "0.4"
 once_cell = "1.9.0"
+jsonrpc-client-transports = "18.0.0"
+jsonrpc-core-client = "18.0.0"
 [lib]
 name = "helloworld"
 crate-type = ["cdylib", "lib"]

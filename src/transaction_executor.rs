@@ -22,17 +22,21 @@ use std::collections::HashMap;
 use log::{info, error};
 use crate::subscription::SLOT_BROADCAST_CHANNEL;
 use crate::raydium_amm::SOL;
+use crate::priority_fee::{self, ACCOUNT_CREATE_PRIORITY_FEE_ESTIMATE, RAYDIUM_PRIORITY_FEE_ESTIMATE};
 use anyhow::anyhow;
+use solana_sdk::commitment_config::CommitmentConfig;
 use spl_associated_token_account::{get_associated_token_address};
 use spl_token::instruction::sync_native;
 use spl_associated_token_account::instruction::create_associated_token_account;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_account_decoder::{UiAccountEncoding, parse_token, UiAccountData};
 use solana_transaction_status::parse_accounts::ParsedAccount;
+use solana_sdk::commitment_config::{CommitmentLevel::Processed};
+use solana_client::rpc_config::RpcSendTransactionConfig;
 
-//pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
-//    read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
-//});
+pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
+    read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
+});
 
 lazy_static! {
     static ref MIN_BALANCE_FOR_RENT_EXEMPTION: Arc<RwLock<u64>> = Arc::new(RwLock::new(0));
@@ -76,7 +80,7 @@ pub fn start_get_block_hash_loop() {
                     Ok(hash) => {
                         let mut old_hash = RECENT_BLOCKHASH.write().await;
                         *old_hash = Some(hash);
-                        info!("Updated block hash: {}", hash);
+                        //info!("Updated block hash: {}", hash);
                     },
                     Err(e) => error!("Failed to fetch recent block hash: {:?}", e),
                 }
@@ -101,26 +105,6 @@ pub async fn gen_associated_token_account(token_mint: &Pubkey, payer: &Pubkey) -
     instructions.push(create_associated_account_ix);
     TOKEN_VAULT_MAP.write().await.insert(token_mint.clone(), user_token_destination);
     Ok((instructions, user_token_destination))
-}
-/*
-pub async fn send_transaction(instructions: &[Instruction], ) -> Result<(), Error> {
-    let pubkey = KEYPAIR.pubkey();
-    if let Some(block_hash) =  RECENT_BLOCKHASH.read().await.clone() {
-        let transaction = Transaction::new_signed_with_payer(
-            instructions,
-            Some(&pubkey),
-            &[&*KEYPAIR],
-            block_hash,
-        );
-        match RPC_CLIENT.send_and_confirm_transaction(&transaction) {
-            Ok(signature) => info!("Transaction successful with signature: {:?}", signature),
-            Err(e) => {
-                error!("Transaction failed: {:?}", e);
-                return Err(anyhow!("transaction failed: {:?}", e));
-            }
-        }
-    }
-    Ok(())
 }
 
 pub async fn init_token_account() -> Result<(), Error>{
@@ -170,27 +154,37 @@ pub async fn init_token_account() -> Result<(), Error>{
     let user_pubkey = KEYPAIR.pubkey();
     let wsol_account = get_associated_token_address(&user_pubkey, &SOL);
     if let None = TOKEN_VAULT_MAP.read().await.get(&SOL) {
+        info!("start to create wsol account");
         let create_wsol_account_ix = create_associated_token_account(&user_pubkey, &user_pubkey, &SOL, &spl_token::id());
         let transfer_sol_ix = system_instruction::transfer(&user_pubkey, &wsol_account, 1_000_000_000); // 1 SOL
         let sync_native_ix = sync_native(&spl_token::id(), &wsol_account)?;
-        let instructions = vec![
+        let mut instructions = vec![
             create_wsol_account_ix,
             transfer_sol_ix,
             sync_native_ix,
         ];
         if let Some(block_hash) = *RECENT_BLOCKHASH.read().await {
-            let transaction = Transaction::new_signed_with_payer(
-                &instructions,
-                Some(&user_pubkey),
-                &[&KEYPAIR],
-                block_hash
-            );
-            let result = RPC_CLIENT.send_and_confirm_transaction(&transaction);
-            match result {
-                Ok(signature) => info!("create wsol account success: {:?}", signature),
-                Err(e) => { 
-                    error!("create wsol account failed: {:?}", e);
-                    return Err(anyhow!("create wsol account failed: {:?}", e))
+            if let Some((priority_fee, _)) = *ACCOUNT_CREATE_PRIORITY_FEE_ESTIMATE.read().await {
+                let compute_budget_instructions = vec![
+                    //ComputeBudgetInstruction::set_compute_unit_price(priority_fee as u64),
+                    ComputeBudgetInstruction::set_compute_unit_price(21222), // TODO: monitor this
+                    ComputeBudgetInstruction::set_compute_unit_limit(80000),
+                ];
+                instructions.extend(compute_budget_instructions);
+                let transaction = Transaction::new_signed_with_payer(
+                    &instructions,
+                    Some(&user_pubkey),
+                    &[&KEYPAIR],
+                    block_hash
+                );
+                info!("start to create wsol account 2");
+                let result = RPC_CLIENT.send_and_confirm_transaction(&transaction);
+                match result {
+                    Ok(signature) => info!("create wsol account success: {:?}", signature),
+                    Err(e) => { 
+                        error!("create wsol account failed: {:?}", e);
+                        return Err(anyhow!("create wsol account failed: {:?}", e))
+                    }
                 }
             }
         }
@@ -200,32 +194,49 @@ pub async fn init_token_account() -> Result<(), Error>{
         }
     }
     TOKEN_VAULT_MAP.write().await.insert(SOL, wsol_account);
+    info!("end init token account");
     Ok(())
 }
 
 pub async fn execute_tx_with_comfirm(instructions: &[Instruction]) -> Result<Signature, Error> {
-    let compute_budget_instructions = vec![
-        ComputeBudgetInstruction::set_compute_unit_price(2122),
-        //ComputeBudgetInstruction::set_compute_unit_price(21222), // TODO: monitor this
-        ComputeBudgetInstruction::set_compute_unit_limit(80000),
-    ];
-    let mut all_instructions = Vec::new();
-    all_instructions.extend_from_slice(&compute_budget_instructions);
-    all_instructions.extend_from_slice(instructions);
-    if let Some(block_hash) = *RECENT_BLOCKHASH.read().await {
-        let transaction = Transaction::new_signed_with_payer(
-            &all_instructions,
-            Some(&KEYPAIR.pubkey()),
-            &[&KEYPAIR],
-            block_hash
-        );
-        match RPC_CLIENT.send_and_confirm_transaction(&transaction) {
-            Ok(sig) => Ok(sig),
-            Err(e) => Err(anyhow!("execute tx failed: {:?}", e))
+    info!("start to execute_tx");
+    if let Some((_, priority_fee)) = *RAYDIUM_PRIORITY_FEE_ESTIMATE.read().await {
+        let mut my_priority_fee = 10.0 * priority_fee;
+        if my_priority_fee >= 5000000.0 {
+            my_priority_fee = 5000000.0;
+        }
+        let compute_budget_instructions = vec![
+            ComputeBudgetInstruction::set_compute_unit_price(my_priority_fee as u64),
+            //ComputeBudgetInstruction::set_compute_unit_price(21222), // TODO: monitor this
+            ComputeBudgetInstruction::set_compute_unit_limit(80000),
+        ];
+        let mut all_instructions = Vec::new();
+        all_instructions.extend_from_slice(&compute_budget_instructions);
+        all_instructions.extend_from_slice(instructions);
+        if let Some(block_hash) = *RECENT_BLOCKHASH.read().await {
+            let transaction = Transaction::new_signed_with_payer(
+                &all_instructions,
+                Some(&KEYPAIR.pubkey()),
+                &[&KEYPAIR],
+                block_hash
+            );
+            //let commit = CommitmentConfig{commitment: Processed};
+            let config = RpcSendTransactionConfig {
+                skip_preflight: true,
+                ..RpcSendTransactionConfig::default()
+            };
+        
+            match RPC_CLIENT.send_transaction_with_config(&transaction, config) {
+                Ok(sig) =>  {info!("processing transaction:{}", sig); Ok(sig)}
+                Err(e) => Err(anyhow!("execute tx failed: {:?}", e))
+            }
+        }
+        else {
+            Err(anyhow!("create wsol account failed: no block hash find"))
         }
     }
     else {
-        Err(anyhow!("create wsol account failed: no block hash find"))
+        Err(anyhow!("no priorty_fee find"))
     }
 }
-    */
+
