@@ -4,7 +4,7 @@ use std::f32::consts::E;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
-use log::info;
+use log::{info, error};
 use chrono::prelude::*;
 use raydium_amm::math::{Calculator, SwapDirection};
 use once_cell::sync::Lazy;
@@ -62,27 +62,39 @@ impl DataSavingStrategy {
     pub fn save_to_parquet(&self) {
         let mut df;
         if self.token0_sol {
-            df = DataFrame::new(vec![
+            match DataFrame::new(vec![
                 Series::new("From", self.data.iter().map(|step| step.from.to_string()).collect::<Vec<_>>()),
                 Series::new("Token0", self.data.iter().map(|step| step.token0).collect::<Vec<_>>()),
                 Series::new("Token1", self.data.iter().map(|step| step.token1).collect::<Vec<_>>()),
                 Series::new("Delta0", self.data.iter().map(|step| step.delta0).collect::<Vec<_>>()),
                 Series::new("Delta1", self.data.iter().map(|step| step.delta1).collect::<Vec<_>>()),
                 Series::new("slot", self.data.iter().map(|step| step.slot).collect::<Vec<_>>()),
-            ]).unwrap();
+            ]) {
+                Ok(s_df) => df = s_df,
+                Err(e) => return
+            }
         }
         else {
-            df = DataFrame::new(vec![
+            match DataFrame::new(vec![
                 Series::new("From", self.data.iter().map(|step| step.from.to_string()).collect::<Vec<_>>()),
                 Series::new("Token0", self.data.iter().map(|step| step.token1).collect::<Vec<_>>()),
                 Series::new("Token1", self.data.iter().map(|step| step.token0).collect::<Vec<_>>()),
                 Series::new("Delta0", self.data.iter().map(|step| step.delta1).collect::<Vec<_>>()),
                 Series::new("Delta1", self.data.iter().map(|step| step.delta0).collect::<Vec<_>>()),
                 Series::new("slot", self.data.iter().map(|step| step.slot).collect::<Vec<_>>()),
-            ]).unwrap();
+            ]) {
+                Ok(s_df) => df = s_df,
+                Err(e) => {
+                    error!("new polars df error:{:?}", e);
+                    return
+                }
+            }
         }
-        let file = std::fs::File::create(&self.file_path).expect("Could not create file.");
-        ParquetWriter::new(file).finish(&mut df).expect("Could not write file.");
+        if let Ok(file) = std::fs::File::create(&self.file_path) {
+            if let Err(e) = ParquetWriter::new(file).finish(&mut df) {
+                error!("save polars error:{:?}", e);
+            }
+        }
     }
 }
 
