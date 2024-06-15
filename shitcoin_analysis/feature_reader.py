@@ -39,10 +39,10 @@ def preprocess_data(features_df, targets_df, feature_columns, target_columns):
     #features_df = features_df.with_columns(((col("slot_elapse") - min_time) / (max_time - min_time)).alias("slot_elapse"))
 
     for column in target_columns:
-        mean = targets_df[column].mean()
-        std = targets_df[column].std()
-        targets_df = targets_df.with_columns(((col(column) - mean) / std).alias(column))
-
+        if "value" in column:
+            mean = targets_df[column].mean()
+            std = targets_df[column].std()
+            targets_df = targets_df.with_columns(((col(column) - mean) / std).alias(column))
     # Remove unnecessary columns at the end
     features_df = features_df.drop(non_numeric_columns)
     targets_df = targets_df.select(target_columns)
