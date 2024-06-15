@@ -6,6 +6,7 @@ from collections import Counter
 from scipy.stats import entropy
 import logging
 from multiprocessing import Pool
+from datetime import datetime
 
 def process_transaction_data(df, file_creation_time):
     # Convert slot to time
@@ -81,8 +82,8 @@ def collect_features(data, current_time, cumulative_data, data_per_second):
 
     # 计算不同时间窗口内的Token0值
     time_windows = [15, 30, 90, 180, 360, 900, 1800, 3600, 5400, 10800]  # 3倍时间窗口
-    cumulative_data_set = cumulative_data.set_index('datetime')
-    data_per_second_set = data_per_second.set_index('second')
+    cumulative_data_set = cumulative_data.with_column(pl.col('datetime').set_sorted())
+    data_per_second_set = data_per_second.with_column(pl.col('second').set_sorted())
     for window in time_windows:
         window_start_time = current_time - pl.duration(seconds=window)
         window_index = pl.select(pl.col('datetime').searchsorted(window_start_time, side='right') - 1)
@@ -206,7 +207,7 @@ def collect_targets(data, current_time):
 
     return targets
 
-def read_and_process(file_path):
+def read_and_process(file_path, date):
     print(f"start to process {file_path}")
     try:
         df = pl.read_parquet(file_path)
@@ -233,7 +234,7 @@ def read_and_process(file_path):
         processed_data, cumulative_data, data_per_second = process_transaction_data(df, file_creation_time)
         all_features = []
         all_targets = []
-        for _, row in processed_data.iter_rows(named=True):
+        for row in processed_data.iter_rows(named=True):
             current_time = row['datetime']
             features = collect_features(processed_data, current_time, cumulative_data, data_per_second)
             targets = collect_targets(processed_data, current_time)
@@ -247,15 +248,16 @@ def read_and_process(file_path):
 
 def process_file(file_path):
     print(f"Processing file: {file_path}")
-    features, targets = read_and_process(file_path)
+    date = os.path.basename(os.path.dirname(file_path))
+    features, targets = read_and_process(file_path, date)
     if features is not None and targets is not None:
         features_df = pl.DataFrame(features)
         targets_df = pl.DataFrame(targets)
-        output_dir = "processed_data"
+        output_dir = f"processed_data/{date}"
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        features_df.write_csv(os.path.join(output_dir, f"{os.path.basename(file_path)}_features.csv"))
-        targets_df.write_csv(os.path.join(output_dir, f"{os.path.basename(file_path)}_targets.csv"))
+        features_df.write_parquet(os.path.join(output_dir, f"{os.path.basename(file_path)}_features.parquet"))
+        targets_df.write_parquet(os.path.join(output_dir, f"{os.path.basename(file_path)}_targets.parquet"))
     else:
         print(f"Failed to process {file_path}")
 
@@ -263,7 +265,7 @@ if __name__ == "__main__":
     import glob
 
     # 获取所有需要处理的文件路径
-    file_paths = glob.glob("../coin_data/*.parquet")
+    file_paths = glob.glob("../coin_data/*/*.parquet")
 
     # 打印获取到的文件路径
     print(f"Found {len(file_paths)} files to process.")
