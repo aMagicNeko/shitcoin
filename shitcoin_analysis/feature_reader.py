@@ -1,5 +1,4 @@
 import os
-import glob
 import random
 import polars as pl
 from polars import col
@@ -7,8 +6,8 @@ from multiprocessing import Pool
 
 def read_and_process_polars(file_path):
     try:
-        # Read the CSV file using Polars
-        df = pl.read_csv(file_path)
+        # Read the Parquet file using Polars
+        df = pl.read_parquet(file_path)
         return df
     except Exception as e:
         print(f"Failed to read {file_path}: {e}")
@@ -19,36 +18,13 @@ def preprocess_data(features_df, targets_df, feature_columns, target_columns):
     features_df = features_df.fill_null(strategy="forward").fill_null(strategy="backward")
     targets_df = targets_df.fill_null(strategy="forward").fill_null(strategy="backward")
 
-    # Add time-related features
-    def time_of_day(hour):
-        if 6 <= hour < 12:
-            return "morning"
-        elif 12 <= hour < 18:
-            return "afternoon"
-        elif 18 <= hour < 24:
-            return "evening"
-        else:
-            return "night"
-
-    # Check if 'current_time' and 'open_time' columns are present
-    if "current_time" not in features_df.columns or "open_time" not in features_df.columns:
-        raise ValueError("Required columns 'current_time' or 'open_time' are missing.")
-
-    features_df = features_df.with_columns([
-        col("current_time").str.strptime(pl.Datetime, fmt="%Y-%m-%d %H:%M:%S").dt.hour().apply(time_of_day).alias("time_of_day"),
-        (col("current_time").str.strptime(pl.Datetime, fmt="%Y-%m-%d %H:%M:%S") - col("open_time").str.strptime(pl.Datetime, fmt="%Y-%m-%d %H:%M:%S")).dt.seconds().alias("elapsed_time_since_open")
-    ])
-
     # Manually one-hot encode the 'time_of_day' feature
     time_of_day_categories = ['morning', 'afternoon', 'evening', 'night']
     for category in time_of_day_categories:
         features_df = features_df.with_columns((col("time_of_day") == category).cast(pl.Int8).alias(f"time_of_day_{category}"))
 
-    # Remove the original 'time_of_day' column
-    features_df = features_df.drop("time_of_day")
-
     # Remove non-numeric columns from normalization
-    non_numeric_columns = ["open_time", "current_time"]
+    non_numeric_columns = ["open_time", 'time_of_day']
     numeric_feature_columns = [col for col in feature_columns if col not in non_numeric_columns]
     
     # Normalize the data
@@ -58,9 +34,9 @@ def preprocess_data(features_df, targets_df, feature_columns, target_columns):
         features_df = features_df.with_columns(((col(column) - mean) / std).alias(column))
     
     # Normalize elapsed_time_since_open
-    min_time = features_df["elapsed_time_since_open"].min()
-    max_time = features_df["elapsed_time_since_open"].max()
-    features_df = features_df.with_columns(((col("elapsed_time_since_open") - min_time) / (max_time - min_time)).alias("elapsed_time_since_open"))
+    #min_time = features_df["slot_elapse"].min()
+    #max_time = features_df["slot_elapse"].max()
+    #features_df = features_df.with_columns(((col("slot_elapse") - min_time) / (max_time - min_time)).alias("slot_elapse"))
 
     for column in target_columns:
         mean = targets_df[column].mean()
@@ -69,18 +45,21 @@ def preprocess_data(features_df, targets_df, feature_columns, target_columns):
 
     # Remove unnecessary columns at the end
     features_df = features_df.drop(non_numeric_columns)
-    #features_df = features_df.select(numeric_feature_columns)
     targets_df = targets_df.select(target_columns)
 
     return features_df, targets_df
 
 def process_files_randomly(directory, num_files):
     # Get a list of all feature and target files in the directory
-    feature_files = glob.glob(os.path.join(directory, "*_features.csv"))
-    target_files = glob.glob(os.path.join(directory, "*_targets.csv"))
+    feature_files = [os.path.join(root, file)
+                     for root, dirs, files in os.walk(directory)
+                     for file in files if file.endswith("_features.parquet")]
+    target_files = [os.path.join(root, file)
+                    for root, dirs, files in os.walk(directory)
+                    for file in files if file.endswith("_targets.parquet")]
 
     # Ensure we have pairs of feature and target files
-    file_pairs = [(f, f.replace("_features.csv", "_targets.csv")) for f in feature_files if f.replace("_features.csv", "_targets.csv") in target_files]
+    file_pairs = [(f, f.replace("_features.parquet", "_targets.parquet")) for f in feature_files if f.replace("_features.parquet", "_targets.parquet") in target_files]
     
     # Select a random subset of file pairs
     selected_pairs = random.sample(file_pairs, min(num_files, len(file_pairs)))
@@ -113,19 +92,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     feature_columns = [
-        'open_token0', 'current_token0', 'token0_value_5s', 'token0_value_10s', 
-        'token0_value_30s', 'token0_value_60s', 'token0_value_120s', 'token0_value_300s', 'token0_value_600s', 
-        'token0_value_1200s', 'token0_value_1800s', 'token0_value_3600s', 'inflow_5s', 'outflow_5s', 
-        'inflow_10s', 'outflow_10s', 'inflow_30s', 'outflow_30s', 'inflow_60s', 'outflow_60s', 'inflow_120s', 
-        'outflow_120s', 'inflow_300s', 'outflow_300s', 'inflow_600s', 'outflow_600s', 'inflow_1200s', 
-        'outflow_1200s', 'inflow_1800s', 'outflow_1800s', 'inflow_3600s', 'outflow_3600s', 'negative_holdings', 
-        'num_addresses', 'max_address_holding', 'top_5_address_holding', 'top_10_address_holding', 
-        'holding_entropy', 'elapsed_time_since_open', 'time_of_day_morning', 'time_of_day_afternoon', 'time_of_day_evening', 'time_of_day_night'
+        'open_token0', 'current_token0', 'token0_value_15slots', 'token0_value_30slots', 
+        'token0_value_90slots', 'token0_value_180slots', 'token0_value_360slots', 'token0_value_900slots', 
+        'token0_value_1800slots', 'token0_value_3600slots', 'token0_value_5400slots', 'token0_value_10800slots', 
+        'inflow_15slots', 'outflow_15slots', 'inflow_30slots', 'outflow_30slots', 'inflow_90slots', 'outflow_90slots', 
+        'inflow_180slots', 'outflow_180slots', 'inflow_360slots', 'outflow_360slots', 'inflow_900slots', 'outflow_900slots', 
+        'inflow_1800slots', 'outflow_1800slots', 'inflow_3600slots', 'outflow_3600slots', 'inflow_5400slots', 'outflow_5400slots', 
+        'inflow_10800slots', 'outflow_10800slots', 'negative_holdings', 'num_addresses', 'max_address_holding', 
+        'top_5_address_holding', 'top_10_address_holding', 'holding_entropy', 'elapsed_time_since_open', 
+        'time_of_day_morning', 'time_of_day_afternoon', 'time_of_day_evening', 'time_of_day_night'
     ]
     
     target_columns = [
-        'token0_value_5s', 'token0_value_10s', 'token0_value_30s', 'token0_value_60s',
-        'token0_value_300s', 'token0_value_600s', 'token0_value_1800s', 'token0_value_3600s'
+        'token0_value_15slots', 'token0_value_30slots', 'token0_value_90slots', 'token0_value_180slots',
+        'token0_value_900slots', 'token0_value_1800slots', 'token0_value_5400slots', 'token0_value_10800slots'
     ]
 
     combined_features_df, combined_targets_df = process_files_randomly(args.directory, args.num_files)

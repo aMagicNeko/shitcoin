@@ -65,7 +65,6 @@ def collect_features(data: pl.DataFrame, row, cumulative_data):
 
     # 当前slot的Token0值
     features['current_slot'] = current_slot
-    #current_index = np.searchsorted(data['slot'].to_numpy(), current_slot, side='right') - 1
     current_token0 = row['Token0_end'] + row['Delta0_end']
     current_token1 = row['Token1_end'] + row['Delta1_end']
 
@@ -82,6 +81,10 @@ def collect_features(data: pl.DataFrame, row, cumulative_data):
     # 添加时间段特征
     current_time = row['datetime_end']
     features['time_of_day'] = get_time_of_day_feature(current_time)
+
+    # 计算与开盘相比过去的多少slot
+    slot_elapse = current_slot - data[0, 'slot_end']
+    features['slot_elapse'] = slot_elapse
 
     # 计算不同slot窗口内的Token0值
     slot_windows = [15, 30, 60, 120, 240, 480, 960, 1920, 3840, 7680]  # 3倍时间窗口
@@ -211,6 +214,14 @@ def read_and_process(file_path, date):
     print(f"start to process {file_path}")
     try:
         df = pl.read_parquet(file_path)
+        # Ensure columns have appropriate data types
+        df = df.with_columns([
+            pl.col('slot').cast(pl.Int64),
+            pl.col('Delta0').cast(pl.Float64),
+            pl.col('Delta1').cast(pl.Float64),
+            pl.col('Token0').cast(pl.Float64),
+            pl.col('Token1').cast(pl.Float64)
+        ])
     except Exception as e:
         print(f"Failed to read {file_path}: {e}")
         return None, None
@@ -221,7 +232,6 @@ def read_and_process(file_path, date):
 
     file_creation_time = datetime.fromtimestamp(os.path.getctime(file_path))
     
-    #try:
     processed_data, cumulative_data = process_transaction_data(df, file_creation_time)
     all_features = []
     all_targets = []
@@ -232,18 +242,31 @@ def read_and_process(file_path, date):
         
         all_features.append(features)
         all_targets.append(targets)
-    return all_features, all_targets
-    #except Exception as e:
-    #print(f"Error processing {file_path}: {e}")
-    return None, None
+
+    # Separate time_of_day column from the rest
+    features_df = pl.DataFrame(all_features)
+    time_of_day_col = features_df.select('time_of_day')
+    features_df = features_df.drop('time_of_day')
+
+    # Ensure that all features are stored as float64 to avoid overflow issues
+    features_df = features_df.with_columns([
+        pl.col(c).cast(pl.Float64)
+        for c in features_df.columns
+    ])
+
+    # Add time_of_day column back
+    features_df = features_df.with_columns(time_of_day_col)
+
+    # Ensure that all targets are stored as float64 to avoid overflow issues
+    targets_df = pl.DataFrame(all_targets)
+
+    return features_df, targets_df
 
 def process_file(file_path):
     print(f"Processing file: {file_path}")
     date = os.path.basename(os.path.dirname(file_path))
-    features, targets = read_and_process(file_path, date)
-    if features is not None and targets is not None:
-        features_df = pl.DataFrame(features)
-        targets_df = pl.DataFrame(targets)
+    features_df, targets_df = read_and_process(file_path, date)
+    if features_df is not None and targets_df is not None:
         output_dir = os.path.join("processed_data", date)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
