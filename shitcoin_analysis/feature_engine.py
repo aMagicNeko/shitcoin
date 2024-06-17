@@ -59,15 +59,10 @@ def process_transaction_data(df: pl.DataFrame, file_creation_time):
     return slot_end_data, df.groupby(['slot', 'From']).agg(pl.col('net_delta0').sum().alias('cumulative_delta0')).sort('slot')
 
 def get_time_of_day_feature(datetime_column):
-    hours = datetime_column.dt.hour()
-    conditions = [
-        (hours >= 6) & (hours < 12),
-        (hours >= 12) & (hours < 18),
-        (hours >= 18) & (hours < 24)
-    ]
-    choices = ['morning', 'afternoon', 'evening']
-    time_of_day = pl.when(conditions[0]).then(choices[0]).when(conditions[1]).then(choices[1]).when(conditions[2]).then(choices[2]).otherwise('night')
-    return time_of_day
+    return (
+        datetime_column.dt.hour()
+        .apply(lambda hour: 'morning' if 6 <= hour < 12 else 'afternoon' if 12 <= hour < 18 else 'evening' if 18 <= hour < 24 else 'night')
+    ).alias('time_of_day')
 
 def fill_missing_slots(slot_end_data, all_slots):
     # Join to fill in missing slots and sort by slot to ensure order
@@ -78,7 +73,8 @@ def fill_missing_slots(slot_end_data, all_slots):
         pl.col('Token0').fill_null(strategy='forward'),
         pl.col('Token1').fill_null(strategy='forward'),
         pl.col('cumulative_inflow').fill_null(strategy='forward'),
-        pl.col('cumulative_outflow').fill_null(strategy='forward')
+        pl.col('cumulative_outflow').fill_null(strategy='forward'),
+        pl.col("datetime").fill_null(strategy='backward')
     ])
     return filled_data
 
