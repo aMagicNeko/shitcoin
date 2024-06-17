@@ -58,7 +58,7 @@ def process_transaction_data(df: pl.DataFrame, file_creation_time):
 
     return slot_end_data, df.groupby(['slot', 'From']).agg(pl.col('net_delta0').sum().alias('cumulative_delta0')).sort('slot')
 
-def get_time_of_day_feature(datetime_column):
+def get_time_of_day_feature(datetime_column: pl.DataFrame):
     return (
         datetime_column.dt.hour()
         .apply(lambda hour: 'morning' if 6 <= hour < 12 else 'afternoon' if 12 <= hour < 18 else 'evening' if 18 <= hour < 24 else 'night')
@@ -254,7 +254,8 @@ def read_and_process(file_path, date):
 
     # Add time_of_day column back
     features_df = features_df.with_columns(time_of_day_col)
-
+    features_df = features_df.drop('Token0')
+    features_df = features_df.drop('Token1')
     # Filter targets_df to keep only original slots
     targets_df = all_targets
     targets_df = targets_df.drop('cumulative_inflow')
@@ -268,7 +269,10 @@ def read_and_process(file_path, date):
 def process_file(file_path):
     print(f"Processing file: {file_path}")
     date = os.path.basename(os.path.dirname(file_path))
-    features_df, targets_df, features_allslots, targets_allslots = read_and_process(file_path, date)
+    try:
+        features_df, targets_df, features_allslots, targets_allslots = read_and_process(file_path, date)
+    except:
+        return
     if features_df is not None and targets_df is not None:
         output_dir = os.path.join("processed_data", date)
         if not os.path.exists(output_dir):
@@ -289,7 +293,6 @@ def get_all_parquet_files(root_dir):
     return file_paths
 
 if __name__ == "__main__":
-    process_file("1XXZVgHFf6suGZ4Je5x7Rz67gHFA6PjSMLpEofz4wB4.parquet")
     root_dir = r"..\coin_data"  # Windows路径
     file_paths = get_all_parquet_files(root_dir)
 

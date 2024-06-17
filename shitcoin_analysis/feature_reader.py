@@ -3,7 +3,8 @@ import random
 import polars as pl
 from polars import col
 from multiprocessing import Pool
-
+import json
+import numpy as np
 def read_and_process_polars(file_path):
     try:
         # Read the Parquet file using Polars
@@ -46,7 +47,7 @@ def preprocess_data(features_df, targets_df, feature_columns, target_columns):
     # Remove unnecessary columns at the end
     features_df = features_df.drop(non_numeric_columns)
     targets_df = targets_df.select(target_columns)
-
+    features_df = features_df.drop('current_slot')
     return features_df, targets_df
 
 def process_files_randomly(directory, num_files):
@@ -81,6 +82,19 @@ def process_files_randomly(directory, num_files):
         return combined_features_df, combined_targets_df
     else:
         return None, None
+
+def save_standardization_params(features_df, target_columns, file_path):
+    params = {}
+    
+    for column in features_df.columns:
+        if column in target_columns:
+            continue
+        mean = features_df[column].mean()
+        std = features_df[column].std()
+        params[column] = {'mean': mean, 'std': std}
+    
+    with open(file_path, 'w') as f:
+        json.dump(params, f)
 
 if __name__ == "__main__":
     import argparse
