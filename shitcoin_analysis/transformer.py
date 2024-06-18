@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-from feature_reader import process_files_randomly
 from torch.utils.data import Dataset, DataLoader
 import os
 import polars as pl
@@ -12,16 +11,24 @@ import torch.optim as optim
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        self.pe = self.generate_positional_encoding(d_model, max_len)
+
+    def generate_positional_encoding(self, d_model, max_len):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        return pe
 
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
+        if x.size(1) > self.max_len:
+            self.pe = self.generate_positional_encoding(self.d_model, x.size(1))
+            self.max_len = x.size(1)
+        x = x + self.pe[:, :x.size(1), :].to(x.device)
         return x
 
 class TransformerEncoder(nn.Module):
@@ -66,15 +73,31 @@ class TransformerModel(nn.Module):
         return torch.sigmoid(output)
 
 class TransactionDataset(Dataset):
-    def __init__(self, features_list, targets_list):
-        self.features_list = features_list
-        self.targets_list = targets_list
+    def __init__(self, features_files, targets_files, mean, std, drop_feature_columns=None, target_column='token0_drop_10%_15slots'):
+        self.features_files = features_files
+        self.targets_files = targets_files
+        self.mean = mean
+        self.std = std
+        self.drop_feature_columns = drop_feature_columns if drop_feature_columns is not None else []
+        self.target_column = target_column
 
     def __len__(self):
-        return len(self.features_list)
+        return len(self.features_files)
 
     def __getitem__(self, idx):
-        return self.features_list[idx], self.targets_list[idx]
+        f_file = self.features_files[idx]
+        t_file = self.targets_files[idx]
+        
+        features_df = pl.read_parquet(f_file, use_pyarrow=True)
+        targets_df = pl.read_parquet(t_file, use_pyarrow=True)
+
+        # Drop specified columns
+        features_df = features_df.drop(self.drop_feature_columns)
+        features_df = (features_df - self.mean) / self.std
+        features_tensor = torch.tensor(features_df.to_numpy(), dtype=torch.float32)
+        targets_tensor = torch.tensor(targets_df[self.target_column].to_numpy(), dtype=torch.float32)
+        
+        return features_tensor, targets_tensor
 
 def get_all_parquet_files(root_dir):
     features_files = []
@@ -90,63 +113,95 @@ def get_all_parquet_files(root_dir):
                         targets_files.append(os.path.join(subdirpath, file))
     return features_files, targets_files
 
-
-def preprocess_data(features_list, targets_list, scaler_path=None, fit_scaler=True):
-    processed_features = []
-    processed_targets = []
+def compute_scaler_params(features_files, drop_feature_columns=None):
+    mean = None
+    M2 = None
+    n = 0
+    drop_feature_columns = drop_feature_columns if drop_feature_columns is not None else []
     
-    if fit_scaler:
-        all_features: pl.DataFrame = pl.concat(features_list)
-        mean = all_features.mean(axis=0)
-        std = all_features.std(axis=0)
-        
-        # 保存标准化参数到 JSON 文件
-        scaler_params = {
-            'mean': mean.tolist(),
-            'scale': std.tolist()
-        }
-        with open(scaler_path, 'w') as f:
-            json.dump(scaler_params, f)
+    for f_file in features_files:
+        features_df = pl.read_parquet(f_file, use_pyarrow=True)
+        features_df = features_df.drop(drop_feature_columns)
+        if mean is None:
+            mean = features_df.mean(axis=0)
+            M2 = ((features_df - mean) ** 2).sum(axis=0)
+            n = len(features_df)
+        else:
+            new_n = len(features_df)
+            new_mean = features_df.mean(axis=0)
+            new_M2 = ((features_df - new_mean) ** 2).sum(axis=0)
+            
+            total_n = n + new_n
+            delta = new_mean - mean
+            mean = (mean * n + new_mean * new_n) / total_n
+            M2 += new_M2 + delta ** 2 * n * new_n / total_n
+            n = total_n
     
-    else:
-        # 从 JSON 文件加载标准化参数
-        with open(scaler_path, 'r') as f:
-            scaler_params = json.load(f)
-        mean = np.array(scaler_params['mean'])
-        scale = np.array(scaler_params['scale'])
+    variance = M2 / (n - 1)
+    std = variance ** 0.5
+    
+    # 保存标准化参数到 JSON 文件
+    scaler_params = {
+        'mean': mean.tolist(),
+        'scale': std.tolist()
+    }
+    with open('scaler_params.json', 'w') as f:
+        json.dump(scaler_params, f)
 
-    for features_df, targets_df in zip(features_list, targets_list):
-        # 标准化特征
-        features_df = (features_df - mean) / scale
-        
-        # 将 DataFrame 转换为 PyTorch 张量
-        features_tensor = torch.tensor(features_df.to_numpy(), dtype=torch.float32)
-        targets_tensor = torch.tensor(targets_df['token0_drop_10%_15slots'].to_numpy(), dtype=torch.float32)
-        
-        processed_features.append(features_tensor)
-        processed_targets.append(targets_tensor)
-    return processed_features, processed_targets
+    return mean, std
 
-def load_parquet_files(features_files, targets_files):
-    features_list = []
-    targets_list = []
-    for f_file, t_file in zip(features_files, targets_files):
-        features_df = pl.read_parquet(f_file)
-        targets_df = pl.read_parquet(t_file)
-        features_list.append(features_df)
-        targets_list.append(targets_df)
-    return features_list, targets_list
+def save_model(model, optimizer, epoch, loss, path='model.pth'):
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, path)
 
+def load_model(model, optimizer, path='model.pth'):
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    return model, optimizer, epoch, loss
 
-if __name__ == "__main___":
+def predict(model, data_loader):
+    model.eval()  # 设置模型为评估模式
+    predictions = []
+    with torch.no_grad():
+        for features, _ in data_loader:
+            outputs = model(features, features)
+            preds = torch.sigmoid(outputs).squeeze()
+            predictions.extend(preds.cpu().numpy())
+    return predictions
+
+def predict_step_by_step(model, features):
+    model.eval()  # 设置模型为评估模式
+    predictions = []
+    with torch.no_grad():
+        for i in range(features.size(0)):
+            feature = features[i].unsqueeze(0).unsqueeze(0)  # 添加 batch 和 sequence 维度
+            preds = model.predict_step(feature).cpu().numpy()
+            predictions.append(preds)
+    model.reset_memory()  # 清除历史数据
+    return np.array(predictions)
+
+if __name__ == "__main__":
     root_dir = 'process_data'
+    drop_feature_columns = ['unnecessary_column1', 'unnecessary_column2']  # 需要丢弃的特征列
+    target_column = 'token0_drop_10%_15slots'
+    
     features_files, targets_files = get_all_parquet_files(root_dir)
-    features_list, targets_list = load_parquet_files(features_files, targets_files)
-    processed_features, processed_targets = preprocess_data(features_list, targets_list)
+    
+    # 计算标准化参数
+    mean, std = compute_scaler_params(features_files, drop_feature_columns)
+    
+    # 创建 TransactionDataset
+    train_dataset = TransactionDataset(features_files, targets_files, mean, std, drop_feature_columns, target_column)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-    train_dataset = TransactionDataset(processed_features, processed_targets)
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)  # 这里batch_size=1是因为每个文件处理为一个序列
-    input_dim = processed_features[0].shape[1]
+    input_dim = mean.shape[0]  # 假设mean的形状与输入特征维度一致
     d_model = 128
     nhead = 8
     num_encoder_layers = 3
@@ -157,8 +212,12 @@ if __name__ == "__main___":
     # 创建 Transformer 模型
     model = TransformerModel(input_dim=input_dim, d_model=d_model, nhead=nhead, num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward, dropout=dropout)
 
-    num_pos_samples = sum([targets.sum().item() for targets in processed_targets])
-    num_neg_samples = sum([len(targets) - targets.sum().item() for targets in processed_targets])
+    # 计算正负样本权重
+    num_pos_samples = 0
+    num_neg_samples = 0
+    for _, targets in train_loader:
+        num_pos_samples += targets.sum().item()
+        num_neg_samples += len(targets) - targets.sum().item()
     pos_weight = num_neg_samples / num_pos_samples
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
@@ -168,17 +227,13 @@ if __name__ == "__main___":
     for epoch in range(num_epochs):
         model.train()  # 将模型设置为训练模式
         running_loss = 0.0
-        for batch in train_loader:
-            # 每个 batch 是一个序列
-            for features, targets in batch:
-                src = features.unsqueeze(0)  # 添加 batch 维度，使输入形状为 (1, seq_len, input_dim)
-                tgt = targets.unsqueeze(0)  # 目标张量也可以使用输入特征，或者使用其他方法生成目标
-                optimizer.zero_grad()  # 梯度清零
-                outputs = model(src, tgt)  # 前向传播
-                targets = tgt.squeeze(0)  # 移除 batch 维度，使目标形状为 (seq_len, input_dim)
-                loss = criterion(outputs, targets)  # 计算损失
-                loss.backward()  # 反向传播
-                optimizer.step()  # 更新参数
-                running_loss += loss.item()  # 累积损失
+        for features, targets in train_loader:
+            optimizer.zero_grad()  # 梯度清零
+            outputs = model(features, features)  # 前向传播
+            loss = criterion(outputs.squeeze(), targets)  # 计算损失
+            loss.backward()  # 反向传播
+            optimizer.step()  # 更新参数
+            running_loss += loss.item()  # 累积损失
 
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}")  # 输出平均损失
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}")
+        save_model(model, optimizer, epoch, running_loss, path=f'model_epoch_{epoch}.pth')
