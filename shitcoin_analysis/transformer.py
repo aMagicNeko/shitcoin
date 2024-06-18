@@ -188,8 +188,8 @@ def predict_step_by_step(model, features):
     return np.array(predictions)
 
 if __name__ == "__main__":
-    root_dir = 'process_data'
-    drop_feature_columns = ['unnecessary_column1', 'unnecessary_column2']  # 需要丢弃的特征列
+    root_dir = 'processed_data'
+    drop_feature_columns = ['slot', 'time_of_day_morning', 'time_of_day_afternoon', 'time_of_day_evening', 'time_of_day_night']  # 需要丢弃的特征列
     target_column = 'token0_drop_10%_15slots'
     
     features_files, targets_files = get_all_parquet_files(root_dir)
