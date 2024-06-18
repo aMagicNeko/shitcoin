@@ -79,12 +79,15 @@ class TransactionDataset(Dataset):
 def get_all_parquet_files(root_dir):
     features_files = []
     targets_files = []
-    for root, dirs, files in os.walk(root_dir):
-        for file in files:
-            if file.endswith('featuresallslots.parquet'):
-                features_files.append(os.path.join(root, file))
-            elif file.endswith('targetsallslots.parquet'):
-                targets_files.append(os.path.join(root, file))
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        for dirname in dirnames:
+            subdir = os.path.join(dirpath, dirname)
+            for subdirpath, subdirnames, subfilenames in os.walk(subdir):
+                for file in subfilenames:
+                    if file.endswith('featuresallslots.parquet'):
+                        features_files.append(os.path.join(subdirpath, file))
+                    elif file.endswith('targetsallslots.parquet'):
+                        targets_files.append(os.path.join(subdirpath, file))
     return features_files, targets_files
 
 
