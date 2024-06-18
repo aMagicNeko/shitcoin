@@ -69,15 +69,17 @@ class TransformerModel(nn.Module):
     def forward(self, src, tgt, src_mask=None, tgt_mask=None, src_key_padding_mask=None, tgt_key_padding_mask=None):
         memory = self.encoder(src, src_mask, src_key_padding_mask)
         output = self.decoder(tgt, memory, tgt_mask, src_mask, tgt_key_padding_mask, src_key_padding_mask)
-        output = self.fc_out(output.mean(dim=0))  # 平均池化
+        output = self.fc_out(output)  # 平均池化
+        #print(f"model out:{output.shape}")
         return torch.sigmoid(output)
 
-class TransactionDataset(Dataset):
-    def __init__(self, features_files, targets_files, mean, std, drop_feature_columns=None, target_column='token0_drop_10%_15slots'):
+class ChunkedTransactionDataset(Dataset):
+    def __init__(self, features_files, targets_files, mean, std, chunk_size, drop_feature_columns=None, target_column='token0_drop_10%_15slots'):
         self.features_files = features_files
         self.targets_files = targets_files
         self.mean = mean
         self.std = std
+        self.chunk_size = chunk_size
         self.drop_feature_columns = drop_feature_columns if drop_feature_columns is not None else []
         self.target_column = target_column
 
@@ -93,11 +95,36 @@ class TransactionDataset(Dataset):
 
         # Drop specified columns
         features_df = features_df.drop(self.drop_feature_columns)
-        features_df = (features_df - self.mean) / self.std
-        features_tensor = torch.tensor(features_df.to_numpy(), dtype=torch.float32)
-        targets_tensor = torch.tensor(targets_df[self.target_column].to_numpy(), dtype=torch.float32)
+        for i, col in enumerate(features_df.columns):
+            features_df = features_df.with_columns((pl.col(col) - self.mean[i]) / self.std[i])
         
-        return features_tensor, targets_tensor
+        features_tensor = torch.tensor(features_df.to_numpy(), dtype=torch.float32)
+        targets_tensor = torch.tensor(targets_df[self.target_column].to_numpy(), dtype=torch.float32).reshape((-1, 1))
+
+        # Split into chunks with overlap to ensure continuity
+        num_chunks = (features_tensor.size(0) + self.chunk_size - 1) // self.chunk_size
+        features_chunks = [features_tensor[i:i+self.chunk_size] for i in range(0, features_tensor.size(0), self.chunk_size)]
+        targets_chunks = [targets_tensor[i:i+self.chunk_size] for i in range(0, targets_tensor.size(0), self.chunk_size)]
+
+        return features_chunks, targets_chunks
+
+def process_in_chunks(model, src_chunks, tgt_chunks, device):
+    model.eval()
+    outputs = []
+
+    with torch.no_grad():
+        memory = None
+        for src_chunk, tgt_chunk in zip(src_chunks, tgt_chunks):
+            src_chunk = src_chunk.unsqueeze(0).to(device)  # Add batch dimension
+            tgt_chunk = tgt_chunk.unsqueeze(0).to(device)  # Add batch dimension
+            if memory is not None:
+                output = model(src_chunk, tgt_chunk, memory=memory)
+            else:
+                output = model(src_chunk, tgt_chunk)
+            memory = output
+            outputs.append(output.cpu())
+
+    return torch.cat(outputs, dim=1)
 
 def get_all_parquet_files(root_dir):
     features_files = []
@@ -124,19 +151,19 @@ def compute_scaler_params(features_files, drop_feature_columns=None):
         features_df = features_df.drop(drop_feature_columns)
         new_M2 = np.zeros((features_df.shape[1]))
         if mean is None:
-            mean = features_df.mean(axis=0)
+            mean = features_df.mean(axis=0).to_numpy().reshape((-1,))
             i = 0
             for col in features_df.columns:
-                new_M2[i] = ((features_df[col] - mean[col]) ** 2).sum()
+                new_M2[i] = ((features_df[col] - mean[i]) ** 2).sum()
                 i += 1
             n = len(features_df)
             M2 = new_M2
         else:
             new_n = len(features_df)
-            new_mean = features_df.mean(axis=0)
+            new_mean = features_df.mean(axis=0).to_numpy().reshape((-1,))
             i = 0
             for col in features_df.columns:
-                new_M2[i] = ((features_df[col] - mean[col]) ** 2).sum()
+                new_M2[i] = ((features_df[col] - mean[i]) ** 2).sum()
                 i += 1
             
             total_n = n + new_n
@@ -158,6 +185,12 @@ def compute_scaler_params(features_files, drop_feature_columns=None):
 
     return mean, std
 
+def load_scaler_params(scaler_path='scaler_params.json'):
+    with open(scaler_path, 'r') as f:
+        scaler_params = json.load(f)
+    mean = np.array(scaler_params['mean'])
+    std = np.array(scaler_params['scale'])
+    return mean, std
 def save_model(model, optimizer, epoch, loss, path='model.pth'):
     torch.save({
         'epoch': epoch,
@@ -196,20 +229,22 @@ def predict_step_by_step(model, features):
     return np.array(predictions)
 
 if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(device)
     root_dir = 'processed_data'
-    drop_feature_columns = ['slot', 'time_of_day']  # 需要丢弃的特征列
     target_column = 'token0_drop_10%_15slots'
-    
+    chunk_size = 100  # 设置分片大小
+    drop_feature_columns = ['slot', 'time_of_day']
     features_files, targets_files = get_all_parquet_files(root_dir)
-    
+
     # 计算标准化参数
-    mean, std = compute_scaler_params(features_files, drop_feature_columns)
-    
-    # 创建 TransactionDataset
-    train_dataset = TransactionDataset(features_files, targets_files, mean, std, drop_feature_columns, target_column)
+    mean, std = load_scaler_params()
+
+    # 创建 ChunkedTransactionDataset
+    train_dataset = ChunkedTransactionDataset(features_files, targets_files, mean, std, chunk_size, drop_feature_columns, target_column)
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
 
-    input_dim = mean.shape[0]  # 假设mean的形状与输入特征维度一致
+    input_dim = mean.shape[0]
     d_model = 128
     nhead = 8
     num_encoder_layers = 3
@@ -219,13 +254,15 @@ if __name__ == "__main__":
 
     # 创建 Transformer 模型
     model = TransformerModel(input_dim=input_dim, d_model=d_model, nhead=nhead, num_encoder_layers=num_encoder_layers, num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward, dropout=dropout)
+    model = model.to(device)
 
     # 计算正负样本权重
     num_pos_samples = 0
     num_neg_samples = 0
-    for _, targets in train_loader:
-        num_pos_samples += targets.sum().item()
-        num_neg_samples += len(targets) - targets.sum().item()
+    for features_chunks, targets_chunks in train_loader:
+        for targets in targets_chunks:
+            num_pos_samples += targets.sum().item()
+            num_neg_samples += len(targets) - targets.sum().item()
     pos_weight = num_neg_samples / num_pos_samples
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
@@ -233,15 +270,17 @@ if __name__ == "__main__":
 
     num_epochs = 10
     for epoch in range(num_epochs):
-        model.train()  # 将模型设置为训练模式
+        model.train()
         running_loss = 0.0
-        for features, targets in train_loader:
-            optimizer.zero_grad()  # 梯度清零
-            outputs = model(features, features)  # 前向传播
-            loss = criterion(outputs.squeeze(), targets)  # 计算损失
-            loss.backward()  # 反向传播
-            optimizer.step()  # 更新参数
-            running_loss += loss.item()  # 累积损失
+        for features_chunks, targets_chunks in train_loader:
+            optimizer.zero_grad()
+            outputs = process_in_chunks(model, features_chunks, targets_chunks, device)
+            outputs = outputs.squeeze(0)
+            targets = torch.cat(targets_chunks).to(device)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
 
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}")
         save_model(model, optimizer, epoch, running_loss, path=f'model_epoch_{epoch}.pth')
