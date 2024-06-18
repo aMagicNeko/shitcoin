@@ -88,8 +88,8 @@ class TransactionDataset(Dataset):
         f_file = self.features_files[idx]
         t_file = self.targets_files[idx]
         
-        features_df = pl.read_parquet(f_file, use_pyarrow=True)
-        targets_df = pl.read_parquet(t_file, use_pyarrow=True)
+        features_df = pl.read_parquet(f_file)
+        targets_df = pl.read_parquet(t_file)
 
         # Drop specified columns
         features_df = features_df.drop(self.drop_feature_columns)
@@ -120,16 +120,24 @@ def compute_scaler_params(features_files, drop_feature_columns=None):
     drop_feature_columns = drop_feature_columns if drop_feature_columns is not None else []
     
     for f_file in features_files:
-        features_df = pl.read_parquet(f_file, use_pyarrow=True)
+        features_df = pl.read_parquet(f_file)
         features_df = features_df.drop(drop_feature_columns)
+        new_M2 = np.zeros((features_df.shape[1]))
         if mean is None:
             mean = features_df.mean(axis=0)
-            M2 = ((features_df - mean) ** 2).sum(axis=0)
+            i = 0
+            for col in features_df.columns:
+                new_M2[i] = ((features_df[col] - mean[col]) ** 2).sum()
+                i += 1
             n = len(features_df)
+            M2 = new_M2
         else:
             new_n = len(features_df)
             new_mean = features_df.mean(axis=0)
-            new_M2 = ((features_df - new_mean) ** 2).sum(axis=0)
+            i = 0
+            for col in features_df.columns:
+                new_M2[i] = ((features_df[col] - mean[col]) ** 2).sum()
+                i += 1
             
             total_n = n + new_n
             delta = new_mean - mean
@@ -189,7 +197,7 @@ def predict_step_by_step(model, features):
 
 if __name__ == "__main__":
     root_dir = 'processed_data'
-    drop_feature_columns = ['slot', 'time_of_day_morning', 'time_of_day_afternoon', 'time_of_day_evening', 'time_of_day_night']  # 需要丢弃的特征列
+    drop_feature_columns = ['slot', 'time_of_day']  # 需要丢弃的特征列
     target_column = 'token0_drop_10%_15slots'
     
     features_files, targets_files = get_all_parquet_files(root_dir)
