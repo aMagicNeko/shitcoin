@@ -1,147 +1,221 @@
+import collections
+import numpy as np
+from scipy.stats import entropy
+from datetime import datetime, timedelta
+import polars as pl
 import os
-import pandas as pd
-import matplotlib.pyplot as plt
-from typing import Dict
-from util import fetch_pool_keys, WSOL, swap_token_amount_base_in
-# 定义处理交易数据的函数
-def process_transaction_data(df):
-    data = df.copy()
+class FeatureExtractor:
+    def __init__(self, file_creation_time, window_size=7681):
+        self.window_size = window_size
+        self.token0_values = collections.deque(maxlen=window_size)
+        self.total_inflow = collections.deque(maxlen=window_size)
+        self.total_outflow = collections.deque(maxlen=window_size)
+        self.top5_holdings = collections.deque(maxlen=window_size)
+        self.top10_holdings = collections.deque(maxlen=window_size)
+        self.max_holdings = collections.deque(maxlen=window_size)
+        self.holding_entropies = collections.deque(maxlen=window_size)
+        self.num_addresses = collections.deque(maxlen=window_size)
+        self.negative_holdings = collections.deque(maxlen=window_size)
+        self.address_holdings = collections.defaultdict(float)
+        self.current_slot = None
+        self.current_inflow = 0
+        self.current_outflow = 0
+        self.current_token0 = 0
+        self.current_token1 = 0
+        self.open_token0 = None
+        self.open_token1 = None
+        self.open_liquidity = None
+        self.open_time = None
+        self.start_slot = None
+        self.inslot_order = {}
+        self.file_creation_time = file_creation_time
+        self.prev_slot = None
 
-    # Convert timestamps
-    data['time'] = pd.to_datetime(data['time'], unit='s', errors='coerce')
-    data = data.dropna(subset=['time'])  # 移除无效时间戳
-    data = data.sort_values('time')
+    def on_slot(self, slot):
+        if self.current_slot != slot and self.current_slot is not None:
+            # Update for the current slot
+            slot_inflow = 0
+            slot_outflow = 0
+            for from_addr, delta in self.inslot_order.items():
+                if from_addr not in self.address_holdings:
+                    self.address_holdings[from_addr] = 0
+                self.address_holdings[from_addr] -= delta[1] # -delta1
+                if delta[0] > 0:
+                    slot_inflow += delta[0]
+                else:
+                    slot_outflow += delta[0]
+            self.current_inflow += slot_inflow
+            self.current_outflow += slot_outflow
+            self.inslot_order = {}
+            for s in range(self.current_slot, slot):
+                self._append_current_slot_data()
+        self.prev_slot = self.current_slot
+        self.current_slot = slot
 
-    # Label buy and sell orders
-    data['type'] = data.apply(lambda row: 'buy' if row['Delta0'] > 0 and row['Delta1'] < 0 else 'sell' if row['Delta0'] < 0 and row['Delta1'] > 0 else 'Deposit' if row['Delta0'] > 0 and row['Delta1'] > 0 else 'Withdraw', axis=1)
+    def update(self, slot, token0, token1, delta0, delta1, from_address):
+        # Initialize opening values on the first slot
+        if self.open_token0 is None:
+            self.open_token0 = token0
+            self.open_token1 = token1
+            self.open_liquidity = token0 * token1
+            self.start_slot = slot
+            self.prev_slot = slot
 
-    # Function to detect sandwich orders
-    def is_sandwich(group):
-        buy_orders = group[group['type'] == 'buy']['Delta0'].sum()
-        sell_orders = group[group['type'] == 'sell']['Delta0'].sum()
-        if sell_orders == 0:
-            return False
-        ratio = buy_orders / abs(sell_orders)
-        return 0.9 <= ratio <= 1.1 and buy_orders > 1e10
+        if self.current_slot != slot and self.current_slot is not None:
+            # Update for the current slot
+            slot_inflow = 0
+            slot_outflow = 0
+            for from_addr, delta in self.inslot_order.items():
+                if from_addr not in self.address_holdings:
+                    self.address_holdings[from_addr] = 0
+                self.address_holdings[from_addr] -= delta[1] # -delta1
+                if delta[0] > 0:
+                    slot_inflow += delta[0]
+                else:
+                    slot_outflow += delta[0]
+            self.current_inflow += slot_inflow
+            self.current_outflow += slot_outflow
+            self.inslot_order = {}
+            for s in range(self.current_slot, slot):
+                self._append_current_slot_data()
+            self.prev_slot = self.current_slot
+        self.current_slot = slot
+        self.current_token0 = token0 + delta0
+        self.current_token1 = token1 + delta1
+        # Update address holdings
+        if from_address not in self.inslot_order:
+            self.inslot_order[from_address] = [0, 0]
+        self.inslot_order[from_address][0] += delta0
+        self.inslot_order[from_address][1] += delta1
 
-    # Filter out sandwich orders
-    filtered_data = data.groupby(['time', 'From']).filter(lambda group: not is_sandwich(group))
+    def _append_current_slot_data(self):
+        self.token0_values.append(self.current_token0)
+        self.total_inflow.append(self.current_inflow)
+        self.total_outflow.append(self.current_outflow)
+
+        positive_holdings = [h for h in self.address_holdings.values() if h > 0]
+        negative_holdings = sum([h for h in self.address_holdings.values() if h < 0])
+        total_token0 = sum(positive_holdings)
+
+        sorted_holdings = sorted(positive_holdings, reverse=True)
+        top5_holding = sum(sorted_holdings[:5]) / total_token0 if total_token0 > 0 else 0
+        top10_holding = sum(sorted_holdings[:10]) / total_token0 if total_token0 > 0 else 0
+        max_holding = sorted_holdings[0] / total_token0
+        self.top5_holdings.append(top5_holding)
+        self.top10_holdings.append(top10_holding)
+        self.max_holdings.append(max_holding)
+        
+        holding_distribution = np.array(positive_holdings) / total_token0 if total_token0 > 0 else np.array([0])
+        self.holding_entropies.append(entropy(holding_distribution))
+
+        self.num_addresses.append(len(positive_holdings))
+        self.negative_holdings.append(negative_holdings)
+
+    def compute_features(self, past_slot=0):
+        # past_slot: skip num of slots
+        if past_slot >= 7680:
+            past_slot = 7680
+        features = {}
+        features['slot'] = self.prev_slot
+        features['open_token0'] = self.open_token0
+        features['open_token1'] = self.open_token1
+        features['open_liquidity'] = self.open_liquidity
+        features['cumulative_inflow'] = self.current_inflow
+        features['cumulative_outflow'] = self.current_outflow
+        features['current_token0'] = self.current_token0
+        features['current_token1'] = self.current_token1
+        current_liquidity = self.current_token0 * self.current_token1
+        features['current_liquidity_ratio'] = current_liquidity / self.open_liquidity if self.open_liquidity else 0
+        features['current_to_open_token0_ratio'] = self.current_token0 / self.open_token0 if self.open_token0 else 0
+        features['slot_elapse'] = self.prev_slot - self.start_slot
+
+        slot_windows = [15, 30, 60, 120, 240, 480, 960, 1920, 3840, 7680]
+        for window in slot_windows:
+            window_token0 = self.token0_values[-window-past_slot-1] if len(self.token0_values) > window+past_slot else self.open_token0
+            features[f'token0_value_{window}slots'] = window_token0
+            features[f'token0_relative_value_{window}slots'] = window_token0 / self.open_token0 if self.open_token0 != 0 else 0
+            features[f'token0_diff_value_{window}slots'] = self.token0_values[-1] - window_token0
+            features[f'token0_relative_diff_value_{window}slots'] = (self.token0_values[-1] - window_token0) / self.open_token0 if self.open_token0 != 0 else 0
+
+            window_inflow = self.total_inflow[-window-past_slot-1] if len(self.total_inflow) > window+past_slot else 0
+            window_outflow = self.total_outflow[-window-past_slot-1] if len(self.total_outflow) > window+past_slot else 0
+            features[f'inflow_{window}slots'] = self.total_inflow[-1] - window_inflow
+            features[f'outflow_{window}slots'] = self.total_outflow[-1] - window_outflow
+        # flow diff
+        for window in slot_windows[:-1]:
+            features[f'inflow_diff_{window}slots'] = 2 * features[f'inflow_{window}slots'] - features[f'inflow_{2 * window}slots']
+            features[f'outflow_diff_{window}slots'] = 2 * features[f'outflow_{window}slots'] - features[f'outflow_{2 * window}slots']
+        positive_holdings = [h for h in self.address_holdings.values() if h > 0]
+        total_token0 = sum(positive_holdings)
+        address_proportions = [v / total_token0 for v in positive_holdings]
+
+        features['negative_holdings'] = sum(h for h in self.address_holdings.values() if h < 0)
+        features['num_addresses'] = len(positive_holdings)
+        features['max_address_holding'] = max(positive_holdings) / total_token0 if total_token0 > 0 else 0
+        features['top_5_address_holding'] = sum(sorted(positive_holdings, reverse=True)[:5]) / total_token0 if total_token0 > 0 else 0
+        features['top_10_address_holding'] = sum(sorted(positive_holdings, reverse=True)[:10]) / total_token0 if total_token0 > 0 else 0
+        features['holding_entropy'] = entropy(address_proportions)
+
+        for window in slot_windows:
+            window_top5_holdings = self.top5_holdings[-window-past_slot-1] if len(self.top5_holdings) > window+past_slot else 1
+            features[f'top_5_address_holding_diff_{window}slots'] = self.top5_holdings[-1] - window_top5_holdings
+
+            window_top10_holdings = self.top10_holdings[-window-past_slot-1] if len(self.top10_holdings) > window+past_slot else 1
+            features[f'top_10_address_holding_diff_{window}slots'] = self.top10_holdings[-1] - window_top10_holdings
+
+            window_max_holdings = self.max_holdings[-window-past_slot-1] if len(self.max_holdings) > window+past_slot else 1
+            features[f'max_address_holding_diff_{window}slots'] = self.max_holdings[-1] - window_max_holdings
+            
+            window_entropy = self.holding_entropies[-window-past_slot-1] if len(self.holding_entropies) > window+past_slot else 0
+            features[f'holding_entropy_diff_{window}slots'] = self.holding_entropies[-1] - window_entropy
+
+            window_num_addresses = self.num_addresses[-window-past_slot-1] if len(self.num_addresses) > window+past_slot else 0
+            features[f'holding_entropy_diff_{window}slots'] = self.num_addresses[-1] - window_num_addresses
+
+            window_negative_holdings = self.negative_holdings[-window-past_slot-1] if len(self.negative_holdings) > window+past_slot else 0
+            features[f'negative_holdings_diff_{window}slots'] = self.negative_holdings[-1] - window_negative_holdings
+
+        current_time = self.file_creation_time + timedelta(milliseconds=int(features['slot_elapse'] * 400))
+        features['time_of_day_morning'] = 1 if 6 <= current_time.hour < 12 else 0
+        features['time_of_day_afternoon'] = 1 if 12 <= current_time.hour < 18 else 0
+        features['time_of_day_evening'] = 1 if 18 <= current_time.hour < 24 else 0
+        features['time_of_day_night'] = 1 if current_time.hour < 6 or current_time.hour >= 24 else 0
+
+        return features
+
+class StrategyBase:
+    # template of a strategy class
+    def __init__(self):
+        self.ntoken = None
+        self.nsol = None
+        self.prev_slot = None
     
-    # Calculate VWAP prices
-    buy_orders = filtered_data[filtered_data['type'] == 'buy'].copy()
-    sell_orders = filtered_data[filtered_data['type'] == 'sell'].copy()
-
-    buy_orders['vwap'] = buy_orders['Delta0'] / abs(buy_orders['Delta1'])
-    sell_orders['vwap'] = abs(sell_orders['Delta0']) / abs(sell_orders['Delta1'])
-
-    buy_vwap = buy_orders.groupby('time').apply(lambda x: (x['vwap'] * abs(x['Delta0'])).sum() / abs(x['Delta0']).sum()).reset_index()
-    buy_vwap.columns = ['time', 'buy_vwap']
-
-    sell_vwap = sell_orders.groupby('time').apply(lambda x: (x['vwap'] * abs(x['Delta0'])).sum() / abs(x['Delta0']).sum()).reset_index()
-    sell_vwap.columns = ['time', 'sell_vwap']
-
-    # Merge buy and sell VWAP prices
-    order_vwap = pd.merge(buy_vwap, sell_vwap, on='time', how='outer')
-    order_vwap['order_vwap'] = (order_vwap['buy_vwap'].fillna(0) + order_vwap['sell_vwap'].fillna(0)) / 2
-
-    # Calculate pool price
-    filtered_data['pool_price'] = filtered_data['Token0'] / filtered_data['Token1']
-
-    # Calculate total inflow and outflow of Token0
-    inflow = buy_orders.groupby('time')['Delta0'].sum().reset_index()
-    inflow.columns = ['time', 'total_inflow']
-
-    outflow = sell_orders.groupby('time')['Delta0'].sum().reset_index()
-    outflow.columns = ['time', 'total_outflow']
-
-    # Get unique time points for pool prices
-    pool_data = filtered_data.drop_duplicates(subset=['time']).sort_values(by='time')
-
-    # Merge VWAP, pool price, inflow, and outflow data
-    merged_data = pd.merge(order_vwap[['time', 'order_vwap']], pool_data[['time', 'pool_price']], on='time', how='outer')
-    merged_data = pd.merge(merged_data, inflow, on='time', how='outer')
-    merged_data = pd.merge(merged_data, outflow, on='time', how='outer')
-
-    # Ensure unique time points
-    merged_data = merged_data.drop_duplicates(subset=['time'])
-    merged_data = merged_data.fillna(0)
-
-    return merged_data, filtered_data
-
-# 定义绘图函数
-def plot_inflow_outflow(data, filtered_data, title, strategy_orders):
-    # Group by time to ensure unique timestamps and sum the values
-    aggregated_data = data.groupby('time').agg({
-        'total_inflow': 'sum',
-        'total_outflow': 'sum'
-    }).reset_index()
-
-    # 计算Token0的累积量
-    aggregated_data['cumulative_token0'] = aggregated_data['total_inflow'].cumsum() + aggregated_data['total_outflow'].cumsum()
-
-    plt.figure(figsize=(30, 7))
-
-    # Plot total inflow as scatter plot
-    plt.scatter(aggregated_data['time'], aggregated_data['total_inflow'], label='Total Inflow', color='green')
-
-    # Plot total outflow as scatter plot
-    plt.scatter(aggregated_data['time'], aggregated_data['total_outflow'], label='Total Outflow', color='red')
-
-    # Plot cumulative Token0 amount as a line plot
-    plt.plot(aggregated_data['time'], aggregated_data['cumulative_token0'], label='Cumulative Token0', color='blue')
-
-    # Plot deposits and withdraws as scatter plots
-    deposits = filtered_data[filtered_data['type'] == 'Deposit']
-    withdraws = filtered_data[filtered_data['type'] == 'Withdraw']
+    def on_slot(self, fe: FeatureExtractor, slot):
+        pass
     
-    plt.scatter(deposits['time'], deposits['Delta0'], label='Deposits', color='purple', marker='^')
-    plt.scatter(withdraws['time'], withdraws['Delta0'], label='Withdraws', color='orange', marker='v')
+    def on_end(self):
+        pass
 
-    # Plot strategy buy and sell orders
-    buy_orders = [order for order in strategy_orders if order[1] < 0]
-    sell_orders = [order for order in strategy_orders if order[1] > 0]
-    
-    plt.scatter([order[0] for order in buy_orders], [order[1] for order in buy_orders], label='Strategy Buys', color='yellow', marker='o')
-    plt.scatter([order[0] for order in sell_orders], [order[1] for order in sell_orders], label='Strategy Sells', color='black', marker='x')
+def start_backtest(file_path, strategy: StrategyBase):
+    file_creation_time = datetime.fromtimestamp(os.path.getctime(file_path))
+    datas = pl.read_parquet(file_path)
+    fe = FeatureExtractor(file_creation_time)
+    prev_slot = None
+    for data in datas.rows(named=True):
+        if data['slot'] != prev_slot and prev_slot is not None:
+            fe.on_slot(data['slot'])
+            strategy.on_slot(fe, data['slot'])
+            #fe.compute_features(data['slot'] - prev_slot - 1)
+        prev_slot = data['slot']
+        fe.update(data['slot'], data['Token0'], data['Token1'], data['Delta0'], data['Delta1'], data['From'])
+    fe.on_slot(datas[-1, 'slot'] + 1)
+    #fe.compute_features()
+    strategy.on_slot()
+    strategy.on_end()
 
-    # Customize the plot
-    plt.xlabel('Time')
-    plt.ylabel('Amount of Token0')
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    plt.xticks(rotation=45)
-    
-    # Show plot
-    plt.show()
-
-def backtest(strategy, df):
-    data = df.copy()
-    strategy.init_process(data['Token0'][0], data['Token1'][0])
-    prev_time = data['time'][0]
-    for t_row in data.iterrows():
-        row = t_row[1]
-        if row['time'] != prev_time:
-            strategy.on_tick(row['time'])
-        if strategy.end:
-            break
-        cur_token0 = row['Token0'] + row['Delta0']
-        cur_token1 = row['Token1'] + row['Delta1']
-        strategy.on_price(cur_token0, cur_token1)
-    strategy.on_tick(row['time'])
-    out_sol = strategy.nsol + swap_token_amount_base_in(strategy.ntoken, cur_token0, cur_token1, True)
-    return out_sol, strategy.my_orders
-
-folder_path = '/Users/ekko/Downloads/coin_data'
-def read(file):
-    print(f"reading {file}")
-    file_path = os.path.join(folder_path, file)
-    df = pd.read_excel(file_path)
-    pool_key = fetch_pool_keys(file.split('_')[0])
-    #print(pool_key)
-    data = df.copy()
-    if pool_key['quote_mint'] == WSOL:
-        #print("here")
-        data['Token0'], data['Token1'] = df['Token1'], df['Token0']
-        data['Delta0'], data['Delta1'] = df['Delta1'], df['Delta0']
-    return data
+def get_all_files(directory):
+    file_paths = []
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            file_paths.append(os.path.join(root, file))
+    return file_paths

@@ -4,13 +4,6 @@ import numpy as np
 from collections import defaultdict
 from scipy.stats import entropy
 from datetime import datetime, timedelta
-
-import os
-import polars as pl
-import numpy as np
-from collections import defaultdict
-from scipy.stats import entropy
-from datetime import datetime, timedelta
 def process_transaction_data(df: pl.DataFrame, file_creation_time):
     # Calculate datetime based on slot and file creation time
     time_diff = (df['slot'] - df['slot'][0]) * 400
@@ -56,7 +49,7 @@ def process_transaction_data(df: pl.DataFrame, file_creation_time):
     slot_end_data = slot_end_data.drop('Token1_end')
     slot_end_data = slot_end_data.drop("datetime_end")
 
-    return slot_end_data, df.groupby(['slot', 'From']).agg(pl.col('net_delta0').sum().alias('cumulative_delta0')).sort('slot')
+    return slot_end_data, df.groupby(['slot', 'From']).agg(pl.col('Delta1').sum().alias('cumulative_delta1')).sort('slot')
 
 def get_time_of_day_feature(datetime_column: pl.DataFrame):
     return (
@@ -110,19 +103,20 @@ def compute_features(data: pl.DataFrame, slot_windows, open_token0, open_token1)
         ])
     
     for i in range(len(slot_windows) - 1):
-        features = features.with_columns((2 * pl.col(f"inflow_{slot_windows[i]}slots") - pl.col(f"inflow_{slot_windows[i+1]}slots")).alias(f"inflow_diff_{slot_windows[i]}slots")) 
+        features = features.with_columns((2 * pl.col(f"inflow_{slot_windows[i]}slots") - pl.col(f"inflow_{slot_windows[i+1]}slots")).alias(f"inflow_diff_{slot_windows[i]}slots"))
+        features = features.with_columns((2 * pl.col(f"outflow_{slot_windows[i]}slots") - pl.col(f"outflow_{slot_windows[i+1]}slots")).alias(f"outflow_diff_{slot_windows[i]}slots"))
     features = features.drop("datetime")
     features = features.drop("open_time")
     return features
 
 def update_holding_distribution(holding_distribution, net_delta):
     address = net_delta['From']
-    delta = net_delta['cumulative_delta0']
+    delta = net_delta['cumulative_delta1']
     
     if address in holding_distribution:
-        holding_distribution[address] += delta
+        holding_distribution[address] -= delta
     else:
-        holding_distribution[address] = delta
+        holding_distribution[address] = -delta
     
     return holding_distribution
 
@@ -211,10 +205,10 @@ def read_and_process(file_path, date):
             holding_features['slot'] = prev_slot  # Add slot information
             holding_features_list.append(holding_features)
         prev_slot = current_slot
-        current_net_delta = row['cumulative_delta0']
+        current_net_delta = row['cumulative_delta1']
         
         # Update holding distribution
-        holding_distribution = update_holding_distribution(holding_distribution, {'From': row['From'], 'cumulative_delta0': current_net_delta})
+        holding_distribution = update_holding_distribution(holding_distribution, {'From': row['From'], 'cumulative_delta1': current_net_delta})
 
     # Compute holding features
     holding_features = compute_holding_features(holding_distribution)
@@ -235,11 +229,11 @@ def read_and_process(file_path, date):
             all_features = all_features.with_columns([
                 (pl.col(col) - shift_col).alias(f'{col}_diff_{window}slots')
             ])
-        col = 'holding_entropy'
-        shift_col = pl.col(col).shift(window).fill_null(0) # avoid big difference
-        all_features = all_features.with_columns([
-                (pl.col(col) - shift_col).alias(f'{col}_diff_{window}slots')
-            ])
+        for col in ['num_addresses', 'negative_holdings', 'holding_entropy']:
+            shift_col = pl.col(col).shift(window).fill_null(0) # avoid big difference
+            all_features = all_features.with_columns([
+                    (pl.col(col) - shift_col).alias(f'{col}_diff_{window}slots')
+                ])
     all_targets = compute_targets(filled_data, [15, 30, 60, 120, 240, 480, 960, 1920, 3840, 7680], open_token0)
 
     # Separate time_of_day column from the rest
@@ -293,7 +287,7 @@ def get_all_parquet_files(root_dir):
     return file_paths
 
 if __name__ == "__main__":
-    root_dir = r"..\coin_data"  # Windows路径
+    root_dir = r"..\coin_data"
     file_paths = get_all_parquet_files(root_dir)
 
     # 打印获取到的文件路径
