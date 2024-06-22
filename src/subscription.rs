@@ -12,7 +12,7 @@ use solana_sdk::{
 use tokio::sync::RwLock;
 use std::{collections::{HashMap, VecDeque}};
 use lazy_static::lazy_static;
-use crate::raydium_amm::{RAY_AMM_ADDRESS, OPENBOOK_MARKET, parse_raydium_transaction, OpenbookInfo, OPENBOOK_MARKET_CACHE, parse_serum_instruction};
+use crate::raydium_amm::{RAY_AMM_ADDRESS, OPENBOOK_MARKET, parse_raydium_transaction, OpenbookInfo, OPENBOOK_MARKET_CACHE, parse_serum_instruction, parse_spl_token_instruction};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::{timeout};
@@ -24,6 +24,9 @@ use solana_client::{
     rpc_response,
 };
 use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
+use spl_token::instruction::{initialize_account, mint_to, transfer};
+use spl_token::state::Account;
+use bs58::decode;
 #[derive(Debug)]
 pub struct Transaction {
     pub account_keys: Vec<Pubkey>,
@@ -47,7 +50,7 @@ impl Ord for Instruction {
         cmp
     }
 }
-
+const SPL_TOKEN_PROGRAM: Pubkey = spl_token::id();
 impl Transaction {
     pub async fn parse_transaction(&self) {
         let mut account_keys = self.account_keys.clone();
@@ -63,11 +66,13 @@ impl Transaction {
         }
         let mut ray_amm_id: i32 = 256;
         let mut openbook_id: i32 = 257;
+        let mut spl_id: i32 = 258;
         let mut i = 0;
         for account in &account_keys {
             match account {
                 &RAY_AMM_ADDRESS => ray_amm_id = i,
                 &OPENBOOK_MARKET => openbook_id = i,
+                &SPL_TOKEN_PROGRAM => spl_id = i,
                 _ => (),
             };
             i += 1
@@ -83,15 +88,18 @@ impl Transaction {
         let mut ray_instructions: Vec<Instruction> = Vec::new();
         for (i, instruction) in self.instructions.iter().enumerate() {
             match instruction.program_id_index {
-                id if id == ray_amm_id as u8  => {
+                id if id as i32 == ray_amm_id  => {
                     let mut accounts: Vec<Pubkey> = Vec::with_capacity(instruction.accounts.len());
                     for index in &instruction.accounts {
                         accounts.push(account_keys[*index as usize]);
                     }
                     ray_instructions.push(Instruction{out_index: i, inner_index: -1, accounts, data: instruction.data.clone()});
                 }
-                id if id == openbook_id as u8 => {
+                id if id as i32 == openbook_id => {
                     parse_serum_instruction(&instruction.data, &instruction.accounts, &account_keys).await;
+                }
+                id if id as i32 == spl_id => {
+                    parse_spl_token_instruction(&instruction.data, &instruction.accounts, &account_keys).await;
                 }
                 _ => ()
             }
@@ -100,12 +108,24 @@ impl Transaction {
             for instructions in inner_instructions.iter() {
                 for (o, uniinstruction) in instructions.instructions.iter().enumerate() {
                     if let UiInstruction::Compiled(instruction) = uniinstruction {
-                        if instruction.program_id_index == ray_amm_id as u8 {
-                            let mut accounts: Vec<Pubkey> = Vec::with_capacity(instruction.accounts.len());
-                            for index in &instruction.accounts {
-                                accounts.push(account_keys[*index as usize]);
+                        match instruction.program_id_index {
+                            id if id as i32 == ray_amm_id => {
+                                let mut accounts: Vec<Pubkey> = Vec::with_capacity(instruction.accounts.len());
+                                for index in &instruction.accounts {
+                                    accounts.push(account_keys[*index as usize]);
+                                }
+                                ray_instructions.push(Instruction{out_index: instructions.index as usize, inner_index: o as i32, accounts: accounts, data: instruction.data.as_bytes().to_vec()});
                             }
-                            ray_instructions.push(Instruction{out_index: instructions.index as usize, inner_index: o as i32, accounts: accounts, data: instruction.data.as_bytes().to_vec()});
+                            id if id as i32 == openbook_id => {
+                                let data = bs58::decode(&instruction.data).into_vec().unwrap();
+                                parse_serum_instruction(&data, &instruction.accounts, &account_keys).await;
+                            }
+                            id if id as i32 == spl_id => {
+                                //let data = base64::decode(&instruction.data).expect("Failed to decode base64 string");
+                                let data = bs58::decode(&instruction.data).into_vec().unwrap();
+                                parse_spl_token_instruction(&data, &instruction.accounts, &account_keys).await;
+                            }
+                            _ => ()
                         }
                     }
                     else {
@@ -170,7 +190,7 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                     {
                         "vote": false,
                         "failed": false,
-                        "accountInclude": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"]
+                        "accountInclude": ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX", SPL_TOKEN_PROGRAM.to_string()]
                         //"accountInclude": ["HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8", "82iPEvGiTceyxYpeLK3DhSwga3R5m4Yfyoydd13CukQ9"]
                     },
                     {

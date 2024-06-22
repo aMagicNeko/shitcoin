@@ -8,12 +8,12 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
 use log::{info, error};
 use tokio::task;
-use crate::strategy::{self, DataSavingStrategy, Step, FallSellStrategy};
+use crate::strategy::{self, DataSavingStrategy, Step, DecisionDirection, SnipeStrategy};
 use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT}, strategy::{Strategy, OnTransactionRet}};
 use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT, KEYPAIR, execute_tx_with_comfirm};
 use serde::{Deserialize, Serialize};
 extern crate base64;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, Sender, Receiver};
@@ -24,15 +24,18 @@ use serum_dex::{instruction::MarketInstruction, state::gen_vault_signer_key};
 use anyhow::{anyhow};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
+use spl_token::instruction::{TokenInstruction, AuthorityType};
+use solana_program::program_option::COption;
 //pub const RAY_AMM_ADDRESS: Pubkey = pubkey!("HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8");
 pub const RAY_AMM_ADDRESS: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 pub const RAY_LOG_PREFIX: &str = "Program log: ray_log: ";
 pub const SOL: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 pub const OPENBOOK_MARKET: Pubkey = pubkey!("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX");
 //pub const OPENBOOK_MARKET: Pubkey = pubkey!("82iPEvGiTceyxYpeLK3DhSwga3R5m4Yfyoydd13CukQ9");
-pub static MY_SOL: Lazy<Arc<RwLock<u64>>> = Lazy::new(|| {
-    Arc::new(RwLock::new(1000000000))
+pub static MY_SOL: Lazy<Arc<RwLock<f64>>> = Lazy::new(|| {
+    Arc::new(RwLock::new(0.0))
 });
+
 #[derive(Debug)]
 pub struct RaydiumAmmPool {
     pub coin_mint: Pubkey,
@@ -109,6 +112,7 @@ impl RaydiumAmmPool {
                 market_pc_vault,
                 market_vault_signer,
             };
+            /*
             {
                 let mut p = ONLY_ONE_POOL.lock().await;
                 if *p != 0 {
@@ -118,21 +122,22 @@ impl RaydiumAmmPool {
                 }
                 *p = 1;
             }
+            */
             let sol_as_coin = coin_mint == SOL;
             info!("new pool {:?}", pool);
-            let init_sol = if sol_as_coin {
-                ntoken0
-            }
-            else {
-                ntoken1
-            };
-            //let mut strategy = DataSavingStrategy::new(&amm_pool, sol_as_coin, );
-            let mut strategy = FallSellStrategy::new(init_sol, sol_as_coin);
             let mut slot_rx = SLOT_BROADCAST_CHANNEL.0.subscribe();
             let mut slot: u64 = *CURRENT_SLOT.read().await;
             let mut failed_cnt = 0;
-            if let Some(swap_decision) = strategy.init_process() {
-                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_decision.zero_for_one).await {
+            let (buy_direction, sell_direction) = if sol_as_coin {
+                (true, false)
+            }
+            else {
+                (false, true)
+            };
+            //let mut strategy = DataSavingStrategy::new(&amm_pool, );
+            let mut strategy = SnipeStrategy::new(ntoken1 as f64, ntoken0 as f64, slot);
+            if let Some(swap_decision) = strategy.init_process().await {
+                while let Err(e) = pool.execute_swap(swap_decision.amount_in, buy_direction).await {
                     info!("init swap error {e}");
                     failed_cnt += 1;
                     if failed_cnt > 4 {
@@ -147,55 +152,65 @@ impl RaydiumAmmPool {
             loop {
                 tokio::select! {
                     Some(step) = rx.recv() => {
-                        pool.ntoken0 = step.token0;
-                        pool.ntoken1 = step.token1;
-                        info!("{:?}" ,step);
-                        if step.from == KEYPAIR.pubkey() {
-                            if step.delta0 > 0 && sol_as_coin {
-                                strategy.on_buy(&step);
-                                let mut my_sol = MY_SOL.write().await;
-                                *my_sol -= step.delta0 as u64;
-                            }
-                            else if step.delta1 > 0 && !sol_as_coin {
-                                strategy.on_buy(&step);
-                                let mut my_sol = MY_SOL.write().await;
-                                *my_sol -= step.delta1 as u64;
-                            }
-                            else if step.delta0 > 0 && !sol_as_coin {
-                                let mut my_sol = MY_SOL.write().await;
-                                *my_sol += (-step.delta1) as u64;
-                                if strategy.on_sell(&step) {
-                                    break;
-                                }
-                            }
-                            else {
-                                let mut my_sol = MY_SOL.write().await;
-                                *my_sol += (-step.delta0) as u64;
-                                if strategy.on_sell(&step) {
-                                    break;
-                                }
-                            }
+                        pool.ntoken0 = step.token0 as u64;
+                        pool.ntoken1 = step.token1 as u64;
+                        let step = if sol_as_coin {
+                            step
                         }
                         else {
-                            match strategy.on_transaction(&step) {
-                                OnTransactionRet::SwapDecision(swap_decision) => {
-                                    let mut i = 0;
-                                    while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_decision.zero_for_one).await {
-                                        error!("execute_swap {}th failed: {}", i, e);
-                                        i += 1;
-                                    }
-                                },
-                                OnTransactionRet::End(is_end) => {
-                                    if is_end {
-                                        break;
-                                    }
+                            Step {
+                                from: step.from,
+                                token0: step.token1,
+                                token1: step.token0,
+                                delta0: step.delta1,
+                                delta1: step.delta0,
+                                slot: step.slot
+                            }
+                        };
+                        info!("{:?}" ,step);
+                        match strategy.on_transaction(&step).await {
+                            OnTransactionRet::SwapDecision(swap_decision) => {
+                                let mut i = 0;
+                                let swap_direction = if swap_decision.direction == DecisionDirection::BUY {
+                                    buy_direction
+                                }
+                                else {
+                                    sell_direction
+                                };
+                                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_direction).await {
+                                    error!("execute_swap {}th failed: {}", i, e);
+                                    i += 1;
+                                }
+                            },
+                            OnTransactionRet::End(is_end) => {
+                                if is_end {
+                                    break;
                                 }
                             }
                         }
                     },
                     Ok(current_slot) = slot_rx.recv() => {
                         slot = current_slot;
-                        //info!("{}", slot);
+                        match strategy.on_slot(slot).await {
+                            OnTransactionRet::SwapDecision(swap_decision) => {
+                                let mut i = 0;
+                                let swap_direction = if swap_decision.direction == DecisionDirection::BUY {
+                                    buy_direction
+                                }
+                                else {
+                                    sell_direction
+                                };
+                                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_direction).await {
+                                    error!("execute_swap {}th failed: {}", i, e);
+                                    i += 1;
+                                }
+                            },
+                            OnTransactionRet::End(is_end) => {
+                                if is_end {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     else => error!("channel closed"),
                 }
@@ -209,10 +224,10 @@ impl RaydiumAmmPool {
     }
     
     pub async fn execute_swap(&self, amount_in: u64, zero_for_one: bool) -> Result<(), Error> {
-        if self.coin_mint == SOL && zero_for_one && amount_in > *MY_SOL.read().await {
+        if self.coin_mint == SOL && zero_for_one && amount_in > *MY_SOL.read().await as u64 {
             return Err(anyhow!("no enough wsol!"));
         }
-        if self.pc_mint == SOL && !zero_for_one && amount_in > *MY_SOL.read().await {
+        if self.pc_mint == SOL && !zero_for_one && amount_in > *MY_SOL.read().await as u64 {
             return Err(anyhow!("no enough wsol!"));
         }
         let user_source_owner = KEYPAIR.pubkey();
@@ -330,8 +345,22 @@ impl RaydiumAmmPoolManager {
             let creator = instruction.accounts[17];
             let creator_token0 = instruction.accounts[18];
             let creator_token1 = instruction.accounts[19];
-            if coin_mint != SOL && pc_mint != SOL {
-                return
+            if coin_mint == SOL {
+                let mut non_freeze_set = NON_FREEZE_TOKEN.write().await;
+                if !non_freeze_set.remove(&pc_mint) {
+                    info!("freeze coin:{pc_mint}");
+                    return;
+                }
+            }
+            else if pc_mint == SOL {
+                let mut non_freeze_set = NON_FREEZE_TOKEN.write().await;
+                if !non_freeze_set.remove(&coin_mint) {
+                    info!("freeze coin:{pc_mint}");
+                    return;
+                }
+            }
+            else {
+                return;
             }
             let openbook_map = OPENBOOK_MARKET_CACHE.lock().await;
             if let Some(market_info) = openbook_map.get(&market) {
@@ -393,10 +422,10 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
             let from = instruction.accounts[12];
             let step = Step {
                 from,
-                token0: log.pool_coin,
-                token1: log.pool_pc,
-                delta0: log.deduct_coin as i64,
-                delta1: log.deduct_pc as i64,
+                token0: log.pool_coin as f64,
+                token1: log.pool_pc as f64,
+                delta0: log.deduct_coin as f64,
+                delta1: log.deduct_pc as f64,
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
@@ -414,10 +443,10 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
             };
             let step = Step {
                 from,
-                token0: log.pool_coin,
-                token1: log.pool_pc,
-                delta0: -(log.out_coin as i64),
-                delta1: -(log.out_pc as i64),
+                token0: log.pool_coin as f64,
+                token1: log.pool_pc as f64,
+                delta0: -(log.out_coin as f64),
+                delta1: -(log.out_pc as f64),
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
@@ -434,17 +463,17 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 instruction.accounts[16]
             };
             let (delta0, delta1) = if log.direction == Coin2PC as u64{
-                (log.amount_in as i64, -(log.out_amount as i64))
+                (log.amount_in as f64, -(log.out_amount as f64))
             }
             else {
-                (-(log.out_amount as i64), log.amount_in as i64)
+                (-(log.out_amount as f64), log.amount_in as f64)
             };
             let step = Step {
                 from,
-                token0: log.pool_coin,
-                token1: log.pool_pc,
-                delta0,
-                delta1,
+                token0: log.pool_coin as f64,
+                token1: log.pool_pc as f64,
+                delta0: delta0 as f64,
+                delta1: delta1 as f64,
                 slot
             };
             POOL_MANAGER.on_step(&pool_address, step).await;
@@ -461,15 +490,15 @@ pub async fn decode_ray_log(log: &str, instruction: &Instruction) {
                 instruction.accounts[16]
             };
             let (delta0, delta1) = if log.direction == Coin2PC as u64{
-                (log.deduct_in as i64, -(log.amount_out as i64))
+                (log.deduct_in as f64, -(log.amount_out as f64))
             }
             else {
-                (-(log.amount_out as i64), log.deduct_in as i64)
+                (-(log.amount_out as f64), log.deduct_in as f64)
             };
             let step = Step {
                 from,
-                token0: log.pool_coin,
-                token1: log.pool_pc,
+                token0: log.pool_coin as f64,
+                token1: log.pool_pc as f64,
                 delta0,
                 delta1,
                 slot
@@ -600,4 +629,103 @@ pub async fn parse_serum_instruction(data: &[u8], accounts: &[u8], account_keys:
             _ => (),
         }
     }
+    else {
+        error!("serum gen_vault_signer_key failed for data {:?}", data);
+    }
+}
+
+lazy_static! {
+    static ref NON_FREEZE_TOKEN: RwLock<HashSet<Pubkey>> = RwLock::new(HashSet::new());
+}
+
+pub async fn parse_spl_token_instruction(data: &[u8], accounts: &[u8], account_keys: &[Pubkey]) {
+    match TokenInstruction::unpack(data) {
+        Ok(instruction) => {
+            match instruction {
+                TokenInstruction::InitializeMint {
+                    decimals,
+                    mint_authority,
+                    freeze_authority,
+                } => {
+                    if freeze_authority == COption::None {
+                        let mut non_freeze_set = NON_FREEZE_TOKEN.write().await;
+                        non_freeze_set.insert(account_keys[accounts[0] as usize]);
+                    }
+                }
+                TokenInstruction::InitializeMint2 {
+                    decimals,
+                    mint_authority,
+                    freeze_authority,
+                } => {
+                    if freeze_authority == COption::None {
+                        let mut non_freeze_set = NON_FREEZE_TOKEN.write().await;
+                        non_freeze_set.insert(account_keys[accounts[0] as usize]);
+                    }
+                }
+                TokenInstruction::InitializeAccount => {
+                }
+                TokenInstruction::InitializeAccount2 { owner } => {                
+                }
+                TokenInstruction::InitializeAccount3 { owner } => {                    
+                }
+                TokenInstruction::InitializeMultisig { m } => {                    
+                }
+                TokenInstruction::InitializeMultisig2 { m } => {                    
+                }
+                TokenInstruction::Transfer { amount } => {                    
+                }
+                TokenInstruction::Approve { amount } => {                    
+                }
+                TokenInstruction::Revoke => {                    
+                }
+                TokenInstruction::SetAuthority {
+                    authority_type,
+                    new_authority,
+                } => {
+                    match authority_type {
+                        AuthorityType::FreezeAccount => {
+                            if new_authority == COption::None {
+                                //info!("set freeze account none :{:?} {:?}", account_keys, account_keys);
+                                let mut non_freeze_set = NON_FREEZE_TOKEN.write().await;
+                                non_freeze_set.insert(account_keys[accounts[0] as usize]);
+                            }
+                        }
+                        _ => ()
+                    }
+                }
+                TokenInstruction::MintTo { amount } => {                    
+                }
+                TokenInstruction::Burn { amount } => {
+                }
+                TokenInstruction::CloseAccount => {                    
+                }
+                TokenInstruction::FreezeAccount => {                    
+                }
+                TokenInstruction::ThawAccount => {                    
+                }
+                TokenInstruction::TransferChecked { amount, decimals } => {     
+                }
+                TokenInstruction::ApproveChecked { amount, decimals } => {                    
+                }
+                TokenInstruction::MintToChecked { amount, decimals } => {                    
+                }
+                TokenInstruction::BurnChecked { amount, decimals } => {                    
+                }
+                TokenInstruction::SyncNative => {                    
+                }
+                TokenInstruction::GetAccountDataSize => {                    
+                }
+                TokenInstruction::InitializeImmutableOwner => {                    
+                }
+                TokenInstruction::AmountToUiAmount { amount } => {                    
+                }
+                TokenInstruction::UiAmountToAmount { ui_amount } => {                    
+                }
+                _ => {
+                }
+            }
+        }
+        Err(e) => error!("parse spl token instruction error:{e}")
+    }
+    
 }

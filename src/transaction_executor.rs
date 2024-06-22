@@ -10,6 +10,7 @@ use solana_sdk::transaction::Transaction;
 use solana_sdk::hash::Hash;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use once_cell::sync::Lazy;
+use tonic::transport::Channel;
 use std::str::FromStr;
 use std::sync::Arc;
 use spl_token::instruction::{initialize_account, mint_to, transfer};
@@ -21,7 +22,7 @@ use solana_sdk::program_pack::Pack;
 use std::collections::HashMap;
 use log::{info, error};
 use crate::subscription::SLOT_BROADCAST_CHANNEL;
-use crate::raydium_amm::SOL;
+use crate::raydium_amm::{MY_SOL, SOL};
 use crate::priority_fee::{self, ACCOUNT_CREATE_PRIORITY_FEE_ESTIMATE, RAYDIUM_PRIORITY_FEE_ESTIMATE};
 use anyhow::anyhow;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -33,7 +34,11 @@ use solana_account_decoder::{UiAccountEncoding, parse_token, UiAccountData};
 use solana_transaction_status::parse_accounts::ParsedAccount;
 use solana_sdk::commitment_config::{CommitmentLevel::Processed};
 use solana_client::rpc_config::RpcSendTransactionConfig;
-
+use crate::jito::{send_bundle_with_confirmation, send_bundle_no_wait, get_searcher_client_no_auth};
+use jito_protos::searcher::searcher_service_client::SearcherServiceClient;
+use tokio::sync::OnceCell;
+use tokio::time::sleep;
+use jito_protos::searcher::SubscribeBundleResultsRequest;
 pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
     read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
 });
@@ -138,6 +143,13 @@ pub async fn init_token_account() -> Result<(), Error>{
                                     }
                                 };
                                 TOKEN_VAULT_MAP.write().await.insert(mint, associate_account);
+                                if mint == SOL {
+                                    if let Some(sol_num) = account_info.get("tokenAmount").unwrap().get("amount").and_then(|v| v.as_str()) {
+                                        let mut my_sol = MY_SOL.write().await;
+                                        *my_sol = sol_num.parse::<u64>().unwrap() as f64;
+                                        info!("init sol num:{sol_num}");
+                                    }
+                                }
                                 info!("Inserted into TOKEN_VAULT_MAP: mint = {}, associate_account = {}", mint, associate_account);
                             }
                         }
@@ -153,16 +165,20 @@ pub async fn init_token_account() -> Result<(), Error>{
     }
     let user_pubkey = KEYPAIR.pubkey();
     let wsol_account = get_associated_token_address(&user_pubkey, &SOL);
-    if let None = TOKEN_VAULT_MAP.read().await.get(&SOL) {
-        info!("start to create wsol account");
-        let create_wsol_account_ix = create_associated_token_account(&user_pubkey, &user_pubkey, &SOL, &spl_token::id());
+    if None == TOKEN_VAULT_MAP.read().await.get(&SOL) || *MY_SOL.read().await < 1000000000.0 {
+        let mut instructions = vec![];
+        if None == TOKEN_VAULT_MAP.read().await.get(&SOL) {
+            info!("start to create wsol account");
+            let create_wsol_account_ix = create_associated_token_account(&user_pubkey, &user_pubkey, &SOL, &spl_token::id());
+            instructions.push(create_wsol_account_ix);
+        }
         let transfer_sol_ix = system_instruction::transfer(&user_pubkey, &wsol_account, 1_000_000_000); // 1 SOL
-        let sync_native_ix = sync_native(&spl_token::id(), &wsol_account)?;
-        let mut instructions = vec![
-            create_wsol_account_ix,
-            transfer_sol_ix,
-            sync_native_ix,
-        ];
+        let mut my_sol = MY_SOL.write().await;
+        *my_sol += 1000000000.0;
+        let sync_native_ix: Instruction = sync_native(&spl_token::id(), &wsol_account)?;
+        instructions.push(transfer_sol_ix);
+        instructions.push(sync_native_ix);
+        info!("start to transfer sol to wsol");
         if let Some(block_hash) = *RECENT_BLOCKHASH.read().await {
             if let Some((priority_fee, _)) = *ACCOUNT_CREATE_PRIORITY_FEE_ESTIMATE.read().await {
                 let compute_budget_instructions = vec![
@@ -201,7 +217,7 @@ pub async fn init_token_account() -> Result<(), Error>{
 pub async fn execute_tx_with_comfirm(instructions: &[Instruction]) -> Result<Signature, Error> {
     info!("start to execute_tx");
     if let Some((_, priority_fee)) = *RAYDIUM_PRIORITY_FEE_ESTIMATE.read().await {
-        let mut my_priority_fee = 10.0 * priority_fee;
+        let mut my_priority_fee = priority_fee;
         if my_priority_fee >= 5000000.0 {
             my_priority_fee = 5000000.0;
         }
@@ -240,3 +256,101 @@ pub async fn execute_tx_with_comfirm(instructions: &[Instruction]) -> Result<Sig
     }
 }
 
+static JITO_CLIENT: OnceCell<Arc<RwLock<SearcherServiceClient<Channel>>>> = OnceCell::const_new();
+
+async fn initialize_jito_client() -> Arc<RwLock<SearcherServiceClient<Channel>>> {
+    let client = get_searcher_client_no_auth("https://tokyo.mainnet.block-engine.jito.wtf")
+        .await
+        .expect("get jito client failed");
+    Arc::new(RwLock::new(client))
+}
+
+async fn get_jito_client() -> Arc<RwLock<SearcherServiceClient<Channel>>> {
+    JITO_CLIENT
+        .get_or_init(initialize_jito_client)
+        .await
+        .clone()
+}
+
+pub fn start_bundle_results_loop() {
+    task::spawn(async move {
+        let client = get_jito_client().await;
+        let _connection_errors: usize = 0;
+        let mut response_errors: usize = 0;
+
+        loop {
+            sleep(Duration::from_millis(1000)).await;
+            let stream = {
+                let mut mut_client = client.write().await;
+                mut_client.subscribe_bundle_results(SubscribeBundleResultsRequest {}).await
+            };
+            match stream {
+                Ok(resp) => {
+                    info!("boudle result: {:?}", resp.into_inner());
+                }
+                Err(e) => {
+                    error!("searcher_bundle_results_error: {}", e);
+                }
+            }
+        }
+    });
+}
+
+
+pub async fn send_bundle() {
+    let client = get_jito_client().await;
+    
+}
+/*
+pub fn send_bundle(rpc_url:, payer, message, num_txs, lamports, tip_account) {
+    let client = get_searcher_client_no_auth(args.block_engine_url.as_str(),).await.expect("Failed to get searcher client with auth. Note: If you don't pass in the auth keypair, we can attempt to connect to the no auth endpoint");
+    let payer_keypair = read_keypair_file(&payer).expect("reads keypair at path");
+
+    // wait for jito-solana leader slot
+    let mut is_leader_slot = false;
+    while !is_leader_slot {
+        let next_leader = client
+            .get_next_scheduled_leader(NextScheduledLeaderRequest {
+                regions: args.regions.clone(),
+            })
+            .await
+            .expect("gets next scheduled leader")
+            .into_inner();
+        let num_slots = next_leader.next_leader_slot - next_leader.current_slot;
+        is_leader_slot = num_slots <= 2;
+        info!(
+            "next jito leader slot in {num_slots} slots in {}",
+            next_leader.next_leader_region
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    // build + sign the transactions
+    let blockhash = rpc_client
+        .get_latest_blockhash()
+        .await
+        .expect("get blockhash");
+    let txs: Vec<_> = (0..num_txs)
+        .map(|i| {
+            VersionedTransaction::from(Transaction::new_signed_with_payer(
+                &[
+                    build_memo(format!("jito bundle {i}: {message}").as_bytes(), &[]),
+                    transfer(&payer_keypair.pubkey(), &tip_account, lamports),
+                ],
+                Some(&payer_keypair.pubkey()),
+                &[&payer_keypair],
+                blockhash,
+            ))
+        })
+        .collect();
+
+    send_bundle_with_confirmation(
+        &txs,
+        &rpc_client,
+        &mut client,
+        &mut bundle_results_subscription,
+    )
+    .await
+    .expect("Sending bundle failed");
+}
+    */
