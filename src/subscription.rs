@@ -12,11 +12,11 @@ use solana_sdk::{
 use tokio::sync::RwLock;
 use std::{collections::{HashMap, VecDeque}};
 use lazy_static::lazy_static;
-use crate::raydium_amm::{RAY_AMM_ADDRESS, OPENBOOK_MARKET, parse_raydium_transaction, OpenbookInfo, OPENBOOK_MARKET_CACHE, parse_serum_instruction, parse_spl_token_instruction};
+use crate::{raydium_amm::{parse_raydium_transaction, parse_serum_instruction, parse_spl_token_instruction, OpenbookInfo, OPENBOOK_MARKET, OPENBOOK_MARKET_CACHE, RAY_AMM_ADDRESS}};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::{timeout};
-use solana_client::{nonblocking::pubsub_client:: PubsubClient, rpc_response::{RpcBlockUpdate, SlotUpdate}};
+use solana_client::{nonblocking::pubsub_client:: PubsubClient, rpc_response::{RpcBlockUpdate, SlotUpdate, RpcSignatureResult::ProcessedSignature}, rpc_config::RpcSignatureSubscribeConfig};
 use tokio::sync::broadcast;
 use std::sync::Arc;
 use solana_client::{
@@ -27,6 +27,10 @@ use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 use spl_token::instruction::{initialize_account, mint_to, transfer};
 use spl_token::state::Account;
 use bs58::decode;
+use futures::stream::FuturesUnordered;
+use anyhow::Error;
+use anyhow::anyhow;
+//use crate::pump_fun::PUMP_FUN_PROGRAM;
 #[derive(Debug)]
 pub struct Transaction {
     pub account_keys: Vec<Pubkey>,
@@ -67,12 +71,14 @@ impl Transaction {
         let mut ray_amm_id: i32 = 256;
         let mut openbook_id: i32 = 257;
         let mut spl_id: i32 = 258;
+        //let mut pumpfun_id: i32 = 259;
         let mut i = 0;
         for account in &account_keys {
             match account {
                 &RAY_AMM_ADDRESS => ray_amm_id = i,
                 &OPENBOOK_MARKET => openbook_id = i,
                 &SPL_TOKEN_PROGRAM => spl_id = i,
+                //&PUMP_FUN_PROGRAM => pumpfun_id = i,
                 _ => (),
             };
             i += 1
@@ -101,6 +107,9 @@ impl Transaction {
                 id if id as i32 == spl_id => {
                     parse_spl_token_instruction(&instruction.data, &instruction.accounts, &account_keys).await;
                 }
+                //id if id as i32 == pumpfun_id => {
+                    
+                //}
                 _ => ()
             }
         }
@@ -178,6 +187,7 @@ impl TransactionFilter {
     }
 }
 
+const WSS_URL: &str = "wss://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
 pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
     task::spawn(async move {
         info!("Starting subscription task");
@@ -264,7 +274,7 @@ pub fn start_subscription(tx: mpsc::Sender<Transaction>) {
                 }
             }
             Ok(Err(e)) => {
-                eprintln!("Error while connecting: {}", e);
+                error!("Error while connecting: {}", e);
             },
             Err(e) => {
                 error!("Failed to connect to Solana WebSocket: {}", e);
@@ -282,12 +292,11 @@ lazy_static! {
 }
 // slot update subscription loop that attempts to maintain a connection to an RPC server
 pub fn start_slot_subscription() {
-    let pubsub_addr = "wss://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2";
     task::spawn(async move {
     info!("Starting subscription task");
     loop {
         let tx = SLOT_BROADCAST_CHANNEL.0.clone();
-        match PubsubClient::new(&pubsub_addr).await {
+        match PubsubClient::new(WSS_URL).await {
             Ok(pubsub_client) => match pubsub_client.slot_updates_subscribe().await {
                 Ok((mut slot_update_subscription, _unsubscribe_fn)) => {
                     let timeout_duration = Duration::from_secs(1);
@@ -315,7 +324,7 @@ pub fn start_slot_subscription() {
 pub fn block_subscribe_loop() {
     task::spawn(async move {
     loop {
-        match PubsubClient::new("wss://mainnet.helius-rpc.com/?api-key=e0f20dbd-b832-4a86-a74d-46c24db098b2").await {
+        match PubsubClient::new(WSS_URL).await {
             Ok(pubsub_client) => match pubsub_client
                 .block_subscribe(
                     RpcBlockSubscribeFilter::All,
@@ -348,4 +357,103 @@ pub fn block_subscribe_loop() {
         }
     }
 });
+}
+
+lazy_static! {
+    pub static ref SIGNATURE_TX: RwLock<Option<mpsc::Sender<Signature>>> = RwLock::new(None);
+}
+
+pub enum TransactionResult {
+    SUCCESS = 0,
+    FAIL = 1
+}
+
+lazy_static! {
+    pub static ref TX_MAP: RwLock<HashMap<Signature, mpsc::Sender<TransactionResult>>> = RwLock::new(HashMap::new());
+}
+
+#[inline]
+pub async fn register_sig_subscription(sig: &Signature, tx: mpsc::Sender<TransactionResult>) -> Result<(), Error> {
+    let mut tx_map = TX_MAP.write().await;
+    tx_map.insert(*sig, tx);
+    let signature_tx = SIGNATURE_TX.read().await;
+    if let Some(sig_tx) = &*signature_tx {
+        sig_tx.send(*sig).await?;
+    }
+    else {
+        error!("failed to register sig: SIGNATURE_TX is none");
+        return Err(anyhow!("SIGNATURE_TX is none"));
+    }
+    Ok(())
+}
+
+#[inline]
+pub async fn unregister_sig_subscription(sig: &Signature) {
+    let mut tx_map = TX_MAP.write().await;
+    tx_map.remove(sig);
+}
+
+pub fn start_signature_subscription() {
+    task::spawn(async move {
+        let client = PubsubClient::new(WSS_URL).await.expect("Failed to connect to PubSub");
+        let mut subscriptions = FuturesUnordered::new();
+        loop {
+            let mut rx = {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Signature>(100);
+                let mut sig_tx = SIGNATURE_TX.write().await;
+                *sig_tx = Some(tx);
+                rx
+            };
+            tokio::select! {
+                Some(sig) = rx.recv() => {
+                    let response_tx = {
+                        let map = TX_MAP.read().await;
+                        map.get(&sig).cloned()
+                    };
+
+                    if let Some(response_tx) = response_tx {
+                        let subscription = client.signature_subscribe(&sig, Some(RpcSignatureSubscribeConfig {
+                            commitment: Some(CommitmentConfig::confirmed()),
+                            enable_received_notification: Some(false),
+                        })).await;
+
+                        match subscription {
+                            Ok((mut stream, _)) => {
+                                subscriptions.push(async move {
+                                    while let Some(result) = stream.next().await {
+                                        match result.value {
+                                            ProcessedSignature(processed_res) => {
+                                                if let Some(err) = processed_res.err {
+                                                    error!("tx failed with: {:?}", err);
+                                                    match response_tx.send(TransactionResult::FAIL).await {
+                                                        Ok(()) => (),
+                                                        Err(e) => error!("signature loop send response failed {e}")
+                                                    }
+                                                    break;
+                                                }
+                                                else { 
+                                                    match response_tx.send(TransactionResult::SUCCESS).await {
+                                                        Ok(()) => (),
+                                                        Err(e) => error!("signature loop send response failed {e}")
+                                                    }
+                                                    break;
+                                                }
+                                            },
+                                            _ => ()
+                                        }
+                                    }
+                                });
+                            },
+                            Err(e) => {
+                                error!("Failed to subscribe to signature {}: {:?}", sig, e);
+                            }
+                        }
+                    } else {
+                        error!("No sender found for signature: {}", sig);
+                    }
+                },
+                Some(_) = subscriptions.next() => {},
+            }
+        }
+    });
 }

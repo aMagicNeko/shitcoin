@@ -58,7 +58,7 @@ def save_model_as_onnx(model, path='random_forest_model.onnx', initial_types=Non
 if __name__ == "__main__":
     feature, target = process_files_randomly('processed_data', 6000)
     feature, target = preprocess_data(feature, target, feature.columns, target.columns, True, 'random_forest_preprocess.json')
-
+    feature = feature.drop('slot')
     # 分割数据集
     X_train, X_test, y_train, y_test = split_data(feature, target['token0_drop_10%_15slots'])
 

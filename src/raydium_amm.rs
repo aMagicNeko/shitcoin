@@ -2,6 +2,7 @@ use anyhow::Error;
 use futures::TryFutureExt;
 use solana_sdk::nonce::state::Data;
 use solana_sdk::program_error::ProgramError;
+use solana_sdk::signature::Signature;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::{pubkey, transaction};
 use solana_sdk::pubkey::Pubkey;
@@ -9,8 +10,8 @@ use solana_sdk::signer::Signer;
 use log::{info, error};
 use tokio::task;
 use crate::strategy::{self, DataSavingStrategy, Step, DecisionDirection, SnipeStrategy};
-use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT}, strategy::{Strategy, OnTransactionRet}};
-use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT, KEYPAIR, execute_tx_with_comfirm};
+use crate::{subscription::{Instruction, SLOT_BROADCAST_CHANNEL, CURRENT_SLOT, TX_MAP, TransactionResult, register_sig_subscription, unregister_sig_subscription}, strategy::{Strategy, OnTransactionRet}};
+use crate::transaction_executor::{gen_associated_token_account, TOKEN_VAULT_MAP, RPC_CLIENT, KEYPAIR, execute_tx_with_comfirm, query_spl_token_balance};
 use serde::{Deserialize, Serialize};
 extern crate base64;
 use std::collections::{HashMap, HashSet};
@@ -112,22 +113,16 @@ impl RaydiumAmmPool {
                 market_pc_vault,
                 market_vault_signer,
             };
-            /*
-            {
-                let mut p = ONLY_ONE_POOL.lock().await;
-                if *p != 0 {
-                    let mut pools = POOL_MANAGER.pools.lock().await;
-                        pools.remove(&amm_pool);
-                        return
-                }
-                *p = 1;
-            }
-            */
             let sol_as_coin = coin_mint == SOL;
+            let token_mint = if sol_as_coin {
+                pc_mint
+            }
+            else {
+                coin_mint
+            };
             info!("new pool {:?}", pool);
             let mut slot_rx = SLOT_BROADCAST_CHANNEL.0.subscribe();
             let mut slot: u64 = *CURRENT_SLOT.read().await;
-            let mut failed_cnt = 0;
             let (buy_direction, sell_direction) = if sol_as_coin {
                 (true, false)
             }
@@ -136,11 +131,16 @@ impl RaydiumAmmPool {
             };
             //let mut strategy = DataSavingStrategy::new(&amm_pool, );
             let mut strategy = SnipeStrategy::new(ntoken1 as f64, ntoken0 as f64, slot);
+            let (sig_tx, mut sig_rx) = mpsc::channel::<TransactionResult>(100);
+            let (token_query_tx, mut token_query_rx) = mpsc::channel::<u64>(10);
+            let mut pending_sell: Option<Signature> = None;
             if let Some(swap_decision) = strategy.init_process().await {
-                while let Err(e) = pool.execute_swap(swap_decision.amount_in, buy_direction).await {
-                    info!("init swap error {e}");
-                    failed_cnt += 1;
-                    if failed_cnt > 4 {
+                match pool.execute_swap(swap_decision.amount_in, buy_direction).await {
+                    Ok(sig) =>  {
+                        query_spl_token_balance(&token_mint, 0, token_query_tx.clone());
+                    }
+                    Err(e) => {
+                        info!("init swap error {e}");
                         let mut pools = POOL_MANAGER.pools.lock().await;
                         pools.remove(&amm_pool);
                         info!("pool {} end", amm_pool);
@@ -170,16 +170,23 @@ impl RaydiumAmmPool {
                         info!("{:?}" ,step);
                         match strategy.on_transaction(&step).await {
                             OnTransactionRet::SwapDecision(swap_decision) => {
-                                let mut i = 0;
                                 let swap_direction = if swap_decision.direction == DecisionDirection::BUY {
                                     buy_direction
                                 }
                                 else {
                                     sell_direction
                                 };
-                                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_direction).await {
-                                    error!("execute_swap {}th failed: {}", i, e);
-                                    i += 1;
+                                match pool.execute_swap(swap_decision.amount_in, swap_direction).await {
+                                    Ok(sig) => {
+                                        if swap_decision.direction == DecisionDirection::SELL {
+                                            register_sig_subscription(&sig, sig_tx.clone()).await;
+                                            pending_sell = Some(sig);
+                                        }
+                                        else {
+                                            query_spl_token_balance(&token_mint, swap_decision.current_position, token_query_tx.clone());
+                                        }
+                                    }
+                                    Err(e) => error!("execute_swap failed: {}", e),
                                 }
                             },
                             OnTransactionRet::End(is_end) => {
@@ -193,16 +200,23 @@ impl RaydiumAmmPool {
                         slot = current_slot;
                         match strategy.on_slot(slot).await {
                             OnTransactionRet::SwapDecision(swap_decision) => {
-                                let mut i = 0;
                                 let swap_direction = if swap_decision.direction == DecisionDirection::BUY {
                                     buy_direction
                                 }
                                 else {
                                     sell_direction
                                 };
-                                while let Err(e) = pool.execute_swap(swap_decision.amount_in, swap_direction).await {
-                                    error!("execute_swap {}th failed: {}", i, e);
-                                    i += 1;
+                                match pool.execute_swap(swap_decision.amount_in, swap_direction).await {
+                                    Ok(sig) => {
+                                        if swap_decision.direction == DecisionDirection::SELL {
+                                            register_sig_subscription(&sig, sig_tx.clone()).await;
+                                            pending_sell = Some(sig);
+                                        }
+                                        else {
+                                            query_spl_token_balance(&token_mint, swap_decision.current_position, token_query_tx.clone());
+                                        }
+                                    }
+                                    Err(e) => error!("execute_swap failed: {}", e),
                                 }
                             },
                             OnTransactionRet::End(is_end) => {
@@ -211,6 +225,38 @@ impl RaydiumAmmPool {
                                 }
                             }
                         }
+                    }
+                    Some(tx_res) = sig_rx.recv() => {
+                        match tx_res {
+                            TransactionResult::SUCCESS => {
+                                match pending_sell {
+                                    Some(sig) => {
+                                        unregister_sig_subscription(&sig).await;
+                                        pending_sell = None;
+                                        strategy.on_sell().await;
+                                    },
+                                    None => {
+                                        error!("no pending tx exist while receiving sig result");
+                                    }
+                                }
+                            },
+                            TransactionResult::FAIL => {
+                                match pending_sell {
+                                    Some(sig) => {
+                                        unregister_sig_subscription(&sig).await;
+                                        pending_sell = None;
+                                        error!("executed tx failed!");
+                                        query_spl_token_balance(&token_mint, 0, token_query_tx.clone());
+                                    },
+                                    None => {
+                                        error!("no pending tx exist while receiving sig result");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(position) = token_query_rx.recv() => {
+                        strategy.update_position(position).await;
                     }
                     else => error!("channel closed"),
                 }
@@ -223,7 +269,7 @@ impl RaydiumAmmPool {
         tx
     }
     
-    pub async fn execute_swap(&self, amount_in: u64, zero_for_one: bool) -> Result<(), Error> {
+    pub async fn execute_swap(&self, amount_in: u64, zero_for_one: bool) -> Result<Signature, Error> {
         if self.coin_mint == SOL && zero_for_one && amount_in > *MY_SOL.read().await as u64 {
             return Err(anyhow!("no enough wsol!"));
         }
@@ -293,7 +339,7 @@ impl RaydiumAmmPool {
         let sig = execute_tx_with_comfirm(&instructions).await?;
         info!("complete swap:{}", sig);
         // get tx detais here or wait for websocket?
-        Ok(())
+        Ok(sig)
     }
 
 }
@@ -305,6 +351,7 @@ pub struct RaydiumAmmPoolManager {
 lazy_static! {
     static ref POOL_MANAGER: Arc<RaydiumAmmPoolManager> = Arc::new(RaydiumAmmPoolManager::new());
 }
+
 pub struct OpenbookInfo {
     pub market: Pubkey,
     pub req_queue: Pubkey,

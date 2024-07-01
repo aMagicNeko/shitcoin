@@ -170,7 +170,7 @@ class FeatureExtractor:
             features[f'holding_entropy_diff_{window}slots'] = self.holding_entropies[-1] - window_entropy
 
             window_num_addresses = self.num_addresses[-window-past_slot-1] if len(self.num_addresses) > window+past_slot else 0
-            features[f'holding_entropy_diff_{window}slots'] = self.num_addresses[-1] - window_num_addresses
+            features[f'num_addresses_diff_{window}slots'] = self.num_addresses[-1] - window_num_addresses
 
             window_negative_holdings = self.negative_holdings[-window-past_slot-1] if len(self.negative_holdings) > window+past_slot else 0
             features[f'negative_holdings_diff_{window}slots'] = self.negative_holdings[-1] - window_negative_holdings
@@ -210,7 +210,7 @@ def start_backtest(file_path, strategy: StrategyBase):
         fe.update(data['slot'], data['Token0'], data['Token1'], data['Delta0'], data['Delta1'], data['From'])
     fe.on_slot(datas[-1, 'slot'] + 1)
     #fe.compute_features()
-    strategy.on_slot()
+    strategy.on_slot(fe, datas[-1, 'slot'] + 1)
     strategy.on_end()
 
 def get_all_files(directory):

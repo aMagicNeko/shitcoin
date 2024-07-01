@@ -53,6 +53,7 @@ class RandomForestStrategy(StrategyBase):
                 i += 1
     
     def on_end(self):
+        i = 0
         for prob_thresh in self.prob_thresh:
             for init_in in self.init_in:
                 print(f"thresh {prob_thresh} init_in {init_in} profit {self.nsol[i]} left_postion {self.ntoken[i]}")

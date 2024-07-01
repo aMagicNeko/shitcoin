@@ -11,12 +11,11 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 use crate::feature_engine::FeatureExtractor;
 use std::sync::Arc;
-use ort::{GraphOptimizationLevel, Session, DynValue, Map, Allocator, ValueRef, DynMap, MapValueType, DynSequenceValueType, DynValueTypeMarker};
-use ndarray::{ArrayD, IxDyn, Array1, Array2};
 use crate::transaction_executor::KEYPAIR;
 use crate::raydium_amm::MY_SOL;
 use solana_sdk::signature::Signer;
 use anyhow::{anyhow, Error};
+use crate::random_forest;
 #[derive(Debug, Clone)]
 pub struct Step {
     pub from: Pubkey,
@@ -34,7 +33,8 @@ pub enum DecisionDirection {
 
 pub struct SwapDecision {
     pub amount_in: u64,
-    pub direction : DecisionDirection
+    pub direction : DecisionDirection,
+    pub current_position: u64
 }
 
 pub enum OnTransactionRet {
@@ -46,6 +46,8 @@ pub trait Strategy: Send {
     async fn on_transaction(&mut self, step: &Step) -> OnTransactionRet;
     async fn init_process(&mut self) -> Option<SwapDecision>;
     async fn on_slot(&mut self, slot: u64) -> OnTransactionRet;
+    async fn on_sell(&mut self);
+    async fn update_position(&mut self, position: u64);
 }
 
 pub struct DataSavingStrategy {
@@ -122,81 +124,57 @@ impl Strategy for DataSavingStrategy {
     async fn on_slot(&mut self, slot: u64) -> OnTransactionRet {
         OnTransactionRet::End(false)
     }
-}
 
-static RANDOM_FOREST: Lazy<Session> = Lazy::new(|| {
-    Session::builder()
-                .unwrap()
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .unwrap()
-                .with_intra_threads(4)
-                .unwrap()
-                .commit_from_file("random_forest_model.onnx")
-                .unwrap()
-});
-
-pub fn print_model_dim() {
-    info!("random forest model input:{:?}, output{:?}", RANDOM_FOREST.inputs, RANDOM_FOREST.outputs);
-}
-
-pub fn predict(features: Vec<f32>) -> Result<f32, Error> {
-    let input_data = Array2::from_shape_vec((1, 155), features).expect("Failed to create input array");
-
-    let input_tensor = ort::inputs![input_data].expect("Failed to create input tensor");
-
-    let outputs = RANDOM_FOREST.run(input_tensor).expect("Failed to run prediction");
-    info!("predict: {:?}", outputs);
-    let allocator = Allocator::default();
-    let predictions_ref = outputs["output_probability"].try_extract_sequence::<DynValueTypeMarker>(&allocator)?;
-
-    for pred in predictions_ref {
-        let map: HashMap<i64, f32> = pred.try_extract_map(&allocator)?;
-        let probability = map.get(&1).expect("map error");
-        return Ok(*probability);
+    async fn on_sell(&mut self) {
     }
-    Err(anyhow!("no resut"))
+
+    async fn update_position(&mut self, position: u64) {
+    }
 }
 
 // SnipeStrategy 结构体
 pub struct SnipeStrategy {
-    delta_sol: f64,
-    delta_token: f64,
+    position: u64,
     prev_slot: u64,
     fe: FeatureExtractor,
+    pending_tx: Option<SwapDecision>
 }
 
 impl SnipeStrategy {
     pub fn new(pool_sol: f64, pool_token: f64, slot: u64) -> Self {
         let fe = FeatureExtractor::new(7681, slot, pool_sol as f32, pool_token as f32);
         SnipeStrategy {
-            delta_sol: 0.0,
-            delta_token: 0.0,
+            position: 0,
             prev_slot: slot,
             fe,
+            pending_tx: None
         }
     }
 }
 
 impl Strategy for SnipeStrategy {
     async fn on_transaction(&mut self, step: &Step) -> OnTransactionRet {
-        self.fe.update(step);
-        if step.from == KEYPAIR.pubkey() {
-            let mut my_sol = MY_SOL.write().await;
-            *my_sol -= step.delta0;
-            self.delta_token -= step.delta1;
-            self.delta_sol -= step.delta0;
-            info!("my order:{:?}", step);
-            if self.delta_token < 1.0 {
-                return OnTransactionRet::End(true);
+        if (step.from == KEYPAIR.pubkey()) {
+            // TODO here, give up this, and ensure the safety of query_spl_token
+            if step.delta0 < 0.0 {
+                self.position = step.delta1 as u64;
+                self.pending_tx = None;
             }
         }
+        self.fe.update(step);
         OnTransactionRet::End(false)
     }
 
     async fn init_process(&mut self) -> Option<SwapDecision> {
-        Some(SwapDecision {
-            amount_in: 8000000,
+        self.pending_tx = Some(SwapDecision {
+            amount_in: 24000000,
             direction: DecisionDirection::BUY,
+            current_position: 0
+        });
+        Some(SwapDecision {
+            amount_in: 24000000,
+            direction: DecisionDirection::BUY,
+            current_position: 0
         })
     }
 
@@ -206,14 +184,26 @@ impl Strategy for SnipeStrategy {
         }
         self.prev_slot = slot;
         self.fe.on_slot(slot);
+        if let Some(decision) = &self.pending_tx {
+            return OnTransactionRet::End(false);
+        }
+        if self.position == 0 {
+            return OnTransactionRet::End(true);
+        }
         let features = self.fe.compute_features();
-        match predict(features) {
+        match random_forest::predict(features) {
             Ok(fall_prob) => {
                 info!("{fall_prob}");
-                if fall_prob >= 0.13 && self.delta_token > 0.001 {
+                if fall_prob >= 0.08 && self.position > 0 {
+                    self.pending_tx = Some(SwapDecision {
+                        amount_in: self.position,
+                        direction: DecisionDirection::SELL,
+                        current_position: self.position
+                    });
                     return OnTransactionRet::SwapDecision(SwapDecision {
-                        amount_in: self.delta_token as u64,
-                        direction: DecisionDirection::SELL
+                        amount_in: self.position,
+                        direction: DecisionDirection::SELL,
+                        current_position: self.position
                     })
                 }
                 else {
@@ -223,5 +213,29 @@ impl Strategy for SnipeStrategy {
             Err(e) => error!("predict failed: {e}")
         }
         OnTransactionRet::End(false)
+    }
+
+    async fn on_sell(&mut self) {
+        match &self.pending_tx {
+            Some(decision) => {
+                match decision.direction {
+                    DecisionDirection::SELL => {
+                        info!("on sell:{}", decision.amount_in);
+                        self.position -= decision.amount_in;
+                    }
+                    DecisionDirection::BUY => ()
+                }
+                self.pending_tx = None;
+            },
+            None => {
+                error!("no pending tx exists while on update_position")
+            }
+        }
+    }
+
+    async fn update_position(&mut self, position: u64) {
+        info!("update position:{}", position);
+        self.position = position;
+        self.pending_tx = None;
     }
 }

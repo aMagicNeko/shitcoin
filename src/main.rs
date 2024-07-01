@@ -7,20 +7,23 @@ mod priority_fee;
 mod jito;
 mod token_authenticator;
 mod feature_engine;
+//mod pump_fun;
 use log::info;
 use env_logger;
 use solana_sdk::signer::{keypair::{read_keypair_file, Keypair}, Signer};
 use hex::FromHex;
 use transaction_executor::{start_get_block_hash_loop, KEYPAIR, init_token_account, start_bundle_results_loop};
+use solana_program::pubkey;
+mod random_forest;
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Logging is initialized.");
-    strategy::print_model_dim();
-    
+    random_forest::print_model_dim();
     info!("pubkey: {} secret_key: {:?}", KEYPAIR.pubkey(), KEYPAIR.secret());
     priority_fee::start_get_priority_fee_estimate_loop();
     subscription::start_slot_subscription();
+    subscription::start_signature_subscription();
     start_get_block_hash_loop();
     //start_bundle_results_loop();
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;

@@ -25,12 +25,12 @@ use crate::subscription::SLOT_BROADCAST_CHANNEL;
 use crate::raydium_amm::{MY_SOL, SOL};
 use crate::priority_fee::{self, ACCOUNT_CREATE_PRIORITY_FEE_ESTIMATE, RAYDIUM_PRIORITY_FEE_ESTIMATE};
 use anyhow::anyhow;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use spl_associated_token_account::{get_associated_token_address};
 use spl_token::instruction::sync_native;
 use spl_associated_token_account::instruction::create_associated_token_account;
 use solana_client::rpc_request::TokenAccountsFilter;
-use solana_account_decoder::{UiAccountEncoding, parse_token, UiAccountData};
+use solana_account_decoder::{UiAccountEncoding, parse_token, UiAccountData, parse_account_data::{AccountAdditionalData, parse_account_data}};
 use solana_transaction_status::parse_accounts::ParsedAccount;
 use solana_sdk::commitment_config::{CommitmentLevel::Processed};
 use solana_client::rpc_config::RpcSendTransactionConfig;
@@ -39,6 +39,7 @@ use jito_protos::searcher::searcher_service_client::SearcherServiceClient;
 use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use jito_protos::searcher::SubscribeBundleResultsRequest;
+use spl_token::state::Mint;
 pub static KEYPAIR: Lazy<Keypair> = Lazy::new(|| {
     read_keypair_file("./my-keypair.json").expect("Failed to read keypair file")
 });
@@ -353,4 +354,76 @@ pub fn send_bundle(rpc_url:, payer, message, num_txs, lamports, tip_account) {
     .await
     .expect("Sending bundle failed");
 }
-    */
+*/
+pub fn query_spl_token_balance(mint: &Pubkey, least_amount: u64, tx: tokio::sync::mpsc::Sender<u64>) {
+    let mint = mint.clone();
+    task::spawn(async move {
+        let vault_address = {
+            let vault_map = TOKEN_VAULT_MAP.read().await;
+            match vault_map.get(&mint) {
+                Some(source_account) => *source_account,
+                None => {
+                    error!("query_spl_token_balance failed: not found mint vault{}", mint);
+                    return ;
+                }
+            }
+        };
+        let mut retry_num = 0;
+        while retry_num < 200 {
+            retry_num += 1;
+            let mint_decimals = match RPC_CLIENT.get_account_with_commitment(&mint, CommitmentConfig {commitment: CommitmentLevel::Processed}) {
+                Ok(response) => {
+                    if let Some(account) = response.value {
+                        match Mint::unpack(&account.data) {
+                            Ok(mint_data) => {
+                                mint_data.decimals
+                            }
+                            Err(e) => {
+                                error!("mint unpack error:{e}");
+                                continue;
+                            }
+                        }
+                    }
+                    else {
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    error!("get_account_with_commitment error:{e}");
+                    continue;
+                }
+            };
+            match RPC_CLIENT.get_account_with_commitment(&vault_address, CommitmentConfig {commitment: CommitmentLevel::Processed}) {
+                Ok(response) => {
+                    if let Some(account_info) = response.value {
+                        match parse_account_data(&vault_address, &spl_token::id(), &account_info.data, Some(AccountAdditionalData {spl_token_decimals: Some(mint_decimals)})) {
+                            Ok(account) =>  {
+                                if let Some(value) = account.parsed.get("info") {
+                                    if let Some(val) = value.get("tokenAmount") {
+                                        if let Some(amount_str) = val.get("amount").and_then(|v| v.as_str()) {
+                                            if let Ok(amount) = amount_str.parse::<u64>() {
+                                                info!("amount:{amount}");
+                                                if amount > least_amount || retry_num == 199 {
+                                                    tx.send(amount).await;
+                                                    return;
+                                                }
+                                            }
+                                        }
+
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("parsed account failed:{e}")
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("get_account failed:{e}")
+                }
+            }
+        }
+        error!("query_spl_token_balance failed for {mint}")
+    });
+}

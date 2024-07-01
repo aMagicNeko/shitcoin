@@ -1,5 +1,5 @@
 from util import *
-from backtest import *
+from shitcoin_analysis.plot_data import *
 import logging
 
 SELL_MIN_VAL = 1000000 # 0.001 sol
